@@ -1,0 +1,24 @@
+{
+  "name": "helper-pay",
+  "private": true,
+  "version": "0.1.0",
+  "description": "An assistant for paying the people who help at home: agreements from messy texts and screenshots, bills checked against them, explicit approval.",
+  "workspaces": [
+    "infra",
+    "ui"
+  ],
+  "scripts": {
+    "test": "go test -C backend ./... && npm -w infra test",
+    "dev": "concurrently -n api,ui \"go run -C backend ./cmd/local\" \"npm -w ui run dev\"",
+    "preflight": "go run -C backend ./cmd/preflight",
+    "deploy": "npm -w ui run build && npm -w infra run deploy",
+    "destroy": "npm -w infra run destroy",
+    "bootstrap": "npm -w infra run bootstrap"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  }
+}

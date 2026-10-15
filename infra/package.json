@@ -1,0 +1,23 @@
+{
+  "name": "helper-pay-infra",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "deploy": "cdk deploy --require-approval never --outputs-file cdk-outputs.json",
+    "destroy": "cdk destroy --force",
+    "synth": "cdk synth",
+    "test": "tsx test/stack.test.ts",
+    "bootstrap": "HELPERPAY_SKIP_UI_CHECK=1 cdk bootstrap"
+  },
+  "dependencies": {
+    "@aws-cdk/aws-lambda-go-alpha": "2.273.0-alpha.0",
+    "aws-cdk-lib": "2.273.0",
+    "constructs": "^10.4.2"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2.1145.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
