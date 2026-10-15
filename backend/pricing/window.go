@@ -122,17 +122,25 @@ func (w Window) clockRanges() [][2]int {
 }
 
 // Matches reports whether an instant falls inside the window.
+// The after-midnight part of a window that crosses midnight belongs to the
+// day it started on: "Fridays 22:00–02:00" covers Saturday 01:00.
 func (w Window) Matches(t time.Time) bool {
-	if !w.dateMatches(t) {
-		return false
-	}
 	mod := t.Hour()*60 + t.Minute()
-	for _, r := range w.clockRanges() {
-		if mod >= r[0] && mod < r[1] {
+	for i, r := range w.clockRanges() {
+		if mod >= r[0] && mod < r[1] && w.dateMatches(w.rangeDay(t, i)) {
 			return true
 		}
 	}
 	return false
+}
+
+// rangeDay is the day whose days/dates decide clock range i at instant t: the
+// previous day for the [00:00, to) part of a window that crosses midnight.
+func (w Window) rangeDay(t time.Time, i int) time.Time {
+	if i == 1 && len(w.clockRanges()) == 2 {
+		return clockOn(t, -1, 12, 0)
+	}
+	return t
 }
 
 // SplitSpanByWindow partitions a span into the minutes inside and outside a window.
@@ -142,16 +150,14 @@ func SplitSpanByWindow(s Span, w Window) (in, out []Span) {
 			in = append(in, day)
 			continue
 		}
-		if !w.dateMatches(day.Start) {
-			out = append(out, day)
-			continue
-		}
-		midnight := time.Date(day.Start.Year(), day.Start.Month(), day.Start.Day(), 0, 0, 0, 0, day.Start.Location())
 		// collect in-window pieces, then derive the gaps
 		var pieces []Span
-		for _, r := range w.clockRanges() {
-			ws := midnight.Add(time.Duration(r[0]) * time.Minute)
-			we := midnight.Add(time.Duration(r[1]) * time.Minute)
+		for i, r := range w.clockRanges() {
+			if !w.dateMatches(w.rangeDay(day.Start, i)) {
+				continue
+			}
+			ws := clockOn(day.Start, 0, r[0]/60, r[0]%60)
+			we := clockOn(day.Start, 0, r[1]/60, r[1]%60)
 			st, en := maxT(ws, day.Start), minT(we, day.End)
 			if en.After(st) {
 				pieces = append(pieces, Span{st, en})

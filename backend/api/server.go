@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -119,7 +120,7 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		code = 404
 	case errors.Is(err, records.ErrHashMismatch), errors.Is(err, records.ErrTermsChanged), errors.Is(err, records.ErrAlreadyApproved), errors.Is(err, records.ErrProposalClosed):
 		code = 409
-	case errors.Is(err, records.ErrPendingUnresolved), errors.Is(err, records.ErrAmountRequired), errors.Is(err, records.ErrNoteRequired):
+	case errors.Is(err, records.ErrPendingUnresolved), errors.Is(err, records.ErrAmountRequired), errors.Is(err, records.ErrNoteRequired), errors.Is(err, records.ErrRefused):
 		code = 422
 	case errors.Is(err, records.ErrInvalid):
 		code = 400
@@ -182,7 +183,7 @@ func (s *Server) helperView(ctx context.Context, h records.Helper, today string)
 	}
 	if cur, ok := pricing.TermsInForce(ts, today); ok {
 		for i := range versions {
-			if versions[i].Terms.EffectiveFrom == cur.EffectiveFrom {
+			if versions[i].Terms.EffectiveFrom == cur.EffectiveFrom && versions[i].Terms.ConfirmedAt == cur.ConfirmedAt {
 				v.CurrentTerms = &versions[i]
 			}
 		}
@@ -462,6 +463,9 @@ func (s *Server) recheckBill(w http.ResponseWriter, r *http.Request) {
 
 // ---- turns ----
 
+// maxTextBytes keeps a pasted text inside one DynamoDB item (400 KB).
+const maxTextBytes = 300_000
+
 type turnReq struct {
 	SessionID string   `json:"sessionId"`
 	Text      string   `json:"text"`
@@ -474,6 +478,10 @@ func (s *Server) createTurn(w http.ResponseWriter, r *http.Request) {
 	var req turnReq
 	if err := decode(r, &req); err != nil || req.SessionID == "" || (strings.TrimSpace(req.Text) == "" && len(req.SourceIDs) == 0) {
 		s.fail(w, fmt.Errorf("bad request: needs sessionId and text or sourceIds"))
+		return
+	}
+	if len(req.Text) > maxTextBytes {
+		s.fail(w, fmt.Errorf("that text is too long; it needs to be under 300 KB, so paste it in parts"))
 		return
 	}
 	id := req.ClientKey
@@ -573,6 +581,10 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 	case "text", "note":
 		if strings.TrimSpace(req.Text) == "" {
 			s.fail(w, fmt.Errorf("bad request: text needs text"))
+			return
+		}
+		if len(req.Text) > maxTextBytes {
+			s.fail(w, fmt.Errorf("that text is too long; it needs to be under 300 KB, so paste it in parts"))
 			return
 		}
 		src.Text = req.Text
@@ -840,15 +852,17 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 		s.json(w, 409, map[string]any{"error": "The assistant is still working on a message in this conversation. Wait for it to finish, then try again.", "code": "turn_in_progress"})
 		return
 	}
+	// Cards are keyed "<turnID>:<n>" by the agent, so match open cards by
+	// prefix: a turn that failed after proposing never lists its ProposalIDs.
 	rejected := 0
-	for _, t := range turns {
-		for _, pid := range t.ProposalIDs {
-			p, err := s.Store.GetProposal(ctx, pid)
-			if err != nil || p.Status != "open" {
-				continue
-			}
-			if _, err := s.Store.CloseProposal(ctx, pid, "rejected", "", now); err == nil {
-				rejected++
+	open, _ := s.Store.ListProposals(ctx, "open")
+	for _, p := range open {
+		for _, t := range turns {
+			if strings.HasPrefix(p.ID, t.ID+":") || slices.Contains(t.ProposalIDs, p.ID) {
+				if _, err := s.Store.CloseProposal(ctx, p.ID, "rejected", "", now); err == nil {
+					rejected++
+				}
+				break
 			}
 		}
 	}

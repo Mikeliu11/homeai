@@ -4,7 +4,7 @@ import { money, clock } from "../money";
 export function ruleSentence(r: Rule): string {
   const w = r.when;
   const when = w
-    ? [w.days?.length ? w.days.map(d => d[0].toUpperCase() + d.slice(1)).join("/") : "", w.from ? `from ${clock(w.from)}` : "", w.to ? `to ${clock(w.to)}` : "", w.dates === "us_federal_holidays" ? "on federal holidays" : "", w.exactDates?.length ? `on ${w.exactDates.join(", ")}` : ""].filter(Boolean).join(" ")
+    ? [w.days?.length ? w.days.map(d => (d[0] ?? "").toUpperCase() + d.slice(1)).join("/") : "", w.from ? `from ${clock(w.from)}` : "", w.to ? `to ${clock(w.to)}` : "", w.dates === "us_federal_holidays" ? "on federal holidays" : "", w.exactDates?.length ? `on ${w.exactDates.join(", ")}` : ""].filter(Boolean).join(" ")
     : "";
   switch (r.kind) {
     case "hourly": return `${money(r.rateCents)}/hr${when ? " " + when : ""}`;

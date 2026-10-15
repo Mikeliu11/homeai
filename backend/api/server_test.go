@@ -229,6 +229,9 @@ func TestSessionsListAndDelete(t *testing.T) {
 	_ = s.Store.PutTurn(ctx, records.Turn{ID: "t1", SessionID: "s1", UserText: "Text from Priya about rates", Status: records.TurnDone, CreatedAt: "2026-10-01T10:00:00Z", UpdatedAt: "2026-10-01T10:00:30Z", ProposalIDs: []string{"p1"}})
 	_ = s.Store.PutTurn(ctx, records.Turn{ID: "t2", SessionID: "s2", UserText: "", SourceIDs: []string{"src"}, Status: records.TurnDone, CreatedAt: "2026-10-02T10:00:00Z", UpdatedAt: "2026-10-02T10:00:30Z"})
 	_, _ = s.Store.PutProposal(ctx, records.Proposal{ID: "p1", Kind: "terms", Status: "open"})
+	// a card from a turn that failed after proposing: keyed by the turn but never listed on it
+	_ = s.Store.PutTurn(ctx, records.Turn{ID: "t3", SessionID: "s1", UserText: "Lupe's bill", Status: records.TurnFailed, CreatedAt: "2026-10-01T11:00:00Z", UpdatedAt: "2026-10-01T11:00:30Z"})
+	_, _ = s.Store.PutProposal(ctx, records.Proposal{ID: "t3:0", Kind: "bill", Status: "open"})
 	code, _ := do(t, h, "GET", "/sessions", nil)
 	if code != 200 {
 		t.Fatalf("list: %d", code)
@@ -238,11 +241,13 @@ func TestSessionsListAndDelete(t *testing.T) {
 		t.Fatalf("unexpected summaries %+v", ss)
 	}
 	code, out := do(t, h, "POST", "/sessions/s1/delete", nil)
-	if code != 200 || out["rejectedCards"] != float64(1) {
+	if code != 200 || out["rejectedCards"] != float64(2) {
 		t.Fatalf("delete: %d %v", code, out)
 	}
-	if p, _ := s.Store.GetProposal(ctx, "p1"); p.Status != "rejected" {
-		t.Fatalf("open card from the deleted conversation should be rejected, got %s", p.Status)
+	for _, id := range []string{"p1", "t3:0"} {
+		if p, _ := s.Store.GetProposal(ctx, id); p.Status != "rejected" {
+			t.Fatalf("open card %s from the deleted conversation should be rejected, got %s", id, p.Status)
+		}
 	}
 	if ts, _ := s.Store.ListTurns(ctx, "s1"); len(ts) != 0 {
 		t.Fatalf("turns should be gone")

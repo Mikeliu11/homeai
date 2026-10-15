@@ -55,7 +55,7 @@ Everything is created with `RemovalPolicy.DESTROY` (tables, buckets, log groups,
 
 ## Conversations
 
-Home lists past conversations on the right. Open one to continue it (the assistant reads that thread back from AgentCore Memory), or delete it: its messages and memory events go, any card from it that was never confirmed is rejected, and confirmed terms and bills are untouched. One audit entry records the deletion.
+**Settings → Show history** lists past conversations. Open one to continue it (the assistant reads that thread back from AgentCore Memory), or delete it: its messages and memory events go, any card from it that was never confirmed is rejected, and confirmed terms and bills are untouched. One audit entry records the deletion.
 
 ## Starting over
 

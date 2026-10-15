@@ -100,12 +100,18 @@ func (m *AgentCoreMemory) Retrieve(ctx context.Context, query string, k int) ([]
 }
 
 func (m *AgentCoreMemory) Remember(ctx context.Context, clientToken, text string) error {
-	_, err := m.Client.BatchCreateMemoryRecords(ctx, &bedrockagentcore.BatchCreateMemoryRecordsInput{
+	out, err := m.Client.BatchCreateMemoryRecords(ctx, &bedrockagentcore.BatchCreateMemoryRecordsInput{
 		MemoryId: aws.String(m.MemoryID), ClientToken: aws.String(token(clientToken)),
 		Records: []types.MemoryRecordCreateInput{{RequestIdentifier: aws.String(token(clientToken)), Namespaces: []string{m.factsNamespace()},
 			Content: &types.MemoryContentMemberText{Value: text}, Timestamp: aws.Time(time.Now())}},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if len(out.FailedRecords) > 0 { // the call can succeed while the record is refused
+		return fmt.Errorf("memory record not stored: %s", aws.ToString(out.FailedRecords[0].ErrorMessage))
+	}
+	return nil
 }
 
 func (m *AgentCoreMemory) List(ctx context.Context) ([]MemoryRecord, error) {

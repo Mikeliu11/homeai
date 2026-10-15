@@ -11,7 +11,8 @@ import { money, periodName , dateName } from "../money";
 export default function BillDetail() {
   const { id } = useParams();
   const [view, setView] = useState<BillView | null>(null);
-  const [err, setErr] = useState("");
+  const [err, setErr] = useState(""); // the page could not load
+  const [actionErr, setActionErr] = useState(""); // an action failed; the page stays
   const [approving, setApproving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [dialogErr, setDialogErr] = useState("");
@@ -32,7 +33,7 @@ export default function BillDetail() {
       setView(v); setApproving(false);
     } catch (e) {
       const ae = e as ApiError;
-      if (ae.code === "terms_changed" && ae.body?.bill) { setView(ae.body.bill); setApproving(false); setErr("The agreement changed since this bill was checked. Here is the new result; review it before approving."); }
+      if (ae.code === "terms_changed" && ae.body?.bill) { setView(ae.body.bill); setApproving(false); setActionErr("The agreement changed since this bill was checked. Here is the new result; review it before approving."); }
       else if (ae.code === "hash_mismatch") { setDialogErr("This bill changed since you opened it. Reload and try again."); }
       else setDialogErr(ae.message);
     } finally { setBusy(false); }
@@ -40,12 +41,13 @@ export default function BillDetail() {
   async function hold() {
     if (!id) return;
     setBusy(true);
-    try { setView(await api.hold(id, holdNote)); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+    setActionErr("");
+    try { setView(await api.hold(id, holdNote)); } catch (e) { setActionErr((e as Error).message); } finally { setBusy(false); }
   }
   async function recheck() {
     if (!id) return;
     setBusy(true);
-    try { setView(await api.recheck(id)); setErr(""); setFlash("Re-checked against the current terms just now."); setTimeout(() => setFlash(""), 4000); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+    try { setView(await api.recheck(id)); setActionErr(""); setFlash("Re-checked against the current terms just now."); setTimeout(() => setFlash(""), 4000); } catch (e) { setActionErr((e as Error).message); } finally { setBusy(false); }
   }
 
   const locked = bill.status === "approved";
@@ -58,7 +60,7 @@ export default function BillDetail() {
         {bill.check && (bill.check.termsUsed ?? []).length > 0 && <span className="small muted">checked against: {(bill.check.termsUsed ?? []).join("; ").replace(/\d{4}-\d{2}-\d{2}/g, d => dateName(d))}</span>}
       </div>
       <Verdict bill={bill} />
-      {err && <div className="error">{err}</div>}
+      {actionErr && <div className="error">{actionErr}</div>}
 
       {!locked && bill.check && (
         <div className="stack" style={{ gap: 6 }}>

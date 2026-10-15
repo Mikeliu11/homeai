@@ -49,7 +49,7 @@ func (d *DynamoStore) put(ctx context.Context, table string, it item, cond *stri
 }
 
 func (d *DynamoStore) get(ctx context.Context, table, pk, sk string, out any) error {
-	res, err := d.Client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: map[string]types.AttributeValue{
+	res, err := d.Client.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), ConsistentRead: aws.Bool(true), Key: map[string]types.AttributeValue{
 		"PK": &types.AttributeValueMemberS{Value: pk}, "SK": &types.AttributeValueMemberS{Value: sk}}})
 	if err != nil {
 		return err
@@ -69,6 +69,7 @@ func (d *DynamoStore) query(ctx context.Context, table string, index *string, ke
 	var start map[string]types.AttributeValue
 	for {
 		res, err := d.Client.Query(ctx, &dynamodb.QueryInput{TableName: aws.String(table), IndexName: index,
+			ConsistentRead:            aws.Bool(index == nil), // base-table reads see our own writes; GSIs cannot
 			KeyConditionExpression:    aws.String("#k = :v"),
 			ExpressionAttributeNames:  map[string]string{"#k": keyName},
 			ExpressionAttributeValues: map[string]types.AttributeValue{":v": &types.AttributeValueMemberS{Value: keyValue}},

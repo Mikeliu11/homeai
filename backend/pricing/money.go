@@ -93,3 +93,9 @@ func (r PerHour) ForMinutes(min int) Cents {
 func (r PerHour) Times(f float64) PerHour {
 	return PerHour(math.Round(float64(r) * f))
 }
+
+// TimesForMinutes is rate × factor for a duration, rounded once to the cent
+// (rounding the multiplied rate first can leave a bill a cent "over").
+func (r PerHour) TimesForMinutes(f float64, min int) Cents {
+	return Cents(math.Round(float64(r) * f * float64(min) / 60))
+}

@@ -200,3 +200,143 @@ func TestCountVsUsualUsesDistinctServiceDates(t *testing.T) {
 		}
 	}
 }
+
+// marcoTerms mirrors the unseen-input proof: $35/hr, 2-hour minimum, half the
+// session if cancelled inside 24h, holidays double.
+func marcoTerms() Terms {
+	return Terms{HelperID: "marco", EffectiveFrom: "2026-09-01", Label: "Marco, terms since 2026-09-01", Rules: []Rule{
+		{ID: "m1", Kind: KindHourly, Service: "hourly", Label: "hourly", RateCents: 3500},
+		{ID: "m2", Kind: KindMinimum, Hours: 2, Per: "booking"},
+		{ID: "m3", Kind: KindFee, Service: "cancellation", Label: "late cancellation", PercentOfBooking: 50, Trigger: &Trigger{CancelledWithinHours: 24}},
+		{ID: "m4", Kind: KindMultiplier, Label: "holidays double", Factor: 2, When: &Window{Dates: "us_federal_holidays"}},
+	}}
+}
+
+func TestCheckMarcoStarter(t *testing.T) {
+	loc := NY()
+	notice := 6.0
+	b := Bill{HelperID: "marco", Period: "2026-09", ClaimedTotalCents: 38500, Lines: []Line{
+		line("2026-09-02", "hourly", "16:00", "17:30", 7000),
+		line("2026-09-07", "hourly", "10:00", "12:00", 14000),
+		line("2026-09-09", "hourly", "16:00", "18:00", 7000),
+		line("2026-09-16", "hourly", "16:00", "18:00", 7000),
+		{Date: "2026-09-23", Service: "cancellation", ClaimedCents: 3500, BookingCents: 7000, Flags: map[string]bool{"cancelled": true}, NoticeHours: &notice},
+	}}
+	cal, _ := Calendar("2026-09", nil, loc)
+	r := CheckBill(b, []Terms{marcoTerms()}, cal, nil, loc)
+	if r.Headline != "Pay $385 — matches what you agreed" {
+		for _, l := range r.Lines {
+			t.Logf("%s %s %d %s", l.Line.Date, l.Status, l.ExpectedCents, l.Explanation)
+		}
+		t.Errorf("marco headline: %q", r.Headline)
+	}
+}
+
+func TestFlaggedLinesStayOutOfAgreedTotal(t *testing.T) {
+	loc := NY()
+	cal, _ := Calendar("2026-09", []Day{"tue"}, loc)
+	b := Bill{HelperID: "lupe", Period: "2026-09", ClaimedTotalCents: 60000, Lines: []Line{
+		{Date: "2026-09-08", ClaimedCents: 14000},
+		{Date: "2026-09-08", ClaimedCents: 14000},  // same date and amount, no times: ask
+		{Date: "2026-10-06", ClaimedCents: 15000},  // outside period (Oct terms: $150)
+		{Date: "2026-09-01", ClaimedCents: 14000}}} // already on another bill
+	r := CheckBill(b, lupeVersions(), cal, map[string]bool{"2026-09-01": true}, loc)
+	if r.AgreedTotalCents != 14000 {
+		t.Errorf("agreed total should hold only line 1: %d", r.AgreedTotalCents)
+	}
+	want := map[int]bool{1: true, 2: true, 3: true}
+	if len(r.PendingDecisions) != 3 {
+		t.Fatalf("want 3 decisions, got %+v", r.PendingDecisions)
+	}
+	for _, d := range r.PendingDecisions {
+		if !want[d.LineIndex] || d.Why == "" {
+			t.Errorf("decision %+v", d)
+		}
+	}
+	for _, f := range r.Flags {
+		if f.Code == "duplicate_line" && f.Level != "info" {
+			t.Errorf("dated-only repeat should be info: %+v", f)
+		}
+	}
+	// 3 decisions; their flags are not counted a second time; no arithmetic problem (lines add to 57000 vs 60000 → +1)
+	if r.Problems != 4 {
+		t.Errorf("problems %d flags %+v", r.Problems, r.Flags)
+	}
+	// an over line that is also a repeat offers the agreed amount as a reading
+	b = Bill{HelperID: "priya", Period: "2026-09", ClaimedTotalCents: 18000, Lines: []Line{
+		line("2026-09-09", "hourly", "15:00", "19:00", 9000), line("2026-09-09", "hourly", "15:00", "19:00", 9000)}}
+	r = CheckBill(b, []Terms{priyaTerms()}, cal, nil, loc)
+	if r.AgreedTotalCents != 8800 || len(r.PendingDecisions) != 1 || r.PendingDecisions[0].Status != StatusAmbiguous ||
+		len(r.PendingDecisions[0].Readings) != 1 || r.PendingDecisions[0].Readings[0].ExpectedCents != 8800 {
+		t.Errorf("timed repeat: agreed %d %+v", r.AgreedTotalCents, r.PendingDecisions)
+	}
+	if !hasFlagLevel(r.Flags, "duplicate_line", "problem") || r.Problems != 2 { // line 1 over + the repeat
+		t.Errorf("timed repeat flags: %d %+v", r.Problems, r.Flags)
+	}
+}
+
+func TestDuplicateKeyIncludesQtyAndNote(t *testing.T) {
+	loc := NY()
+	cal, _ := Calendar("2026-09", nil, loc)
+	th := theoVersions()
+	b := Bill{HelperID: "theo", Period: "2026-09", ClaimedTotalCents: 8400, Lines: []Line{
+		{Date: "2026-09-09", Service: "walk_30", ClaimedCents: 2800, Note: "morning walk"},
+		{Date: "2026-09-09", Service: "walk_30", ClaimedCents: 2800, Note: "evening walk"},
+		{Date: "2026-09-10", Service: "walk_30", Qty: 1, ClaimedCents: 2800}}}
+	r := CheckBill(b, th, cal, nil, loc)
+	if hasFlag(r.Flags, "duplicate_line") || r.Headline != "Pay $84 — matches what you agreed" {
+		t.Errorf("two walks with different notes are not a repeat: %q %+v", r.Headline, r.Flags)
+	}
+}
+
+func hasFlagLevel(fs []Flag, code, level string) bool {
+	for _, f := range fs {
+		if f.Code == code && f.Level == level {
+			return true
+		}
+	}
+	return false
+}
+
+func TestUndatedLineSamePriceUnderEverySnapshot(t *testing.T) {
+	loc := NY()
+	cal, _ := Calendar("2026-09", []Day{"tue"}, loc)
+	// the deep clean is $220 before and after Lupe's mid-month change: no "could be $220 or $220"
+	b := Bill{HelperID: "lupe", Period: "2026-09", ClaimedTotalCents: 22000, Lines: []Line{{Service: "deep_clean", Qty: 1, ClaimedCents: 22000}}}
+	r := CheckBill(b, lupeVersions(), cal, nil, loc)
+	if r.Lines[0].Status != StatusMatch || strings.Contains(r.Lines[0].Explanation, "or $220") {
+		t.Errorf("deep clean across the change: %s %s", r.Lines[0].Status, r.Lines[0].Explanation)
+	}
+	// a superseded correction with the same effectiveFrom is not a third reading
+	first := lupeTerms("2026-09-15", 16000)
+	first.ConfirmedAt, first.Label = "2026-09-10T00:00:00Z", "first try"
+	corr := lupeTerms("2026-09-15", 15000)
+	corr.ConfirmedAt = "2026-09-11T00:00:00Z"
+	b = Bill{HelperID: "lupe", Period: "2026-09", ClaimedTotalCents: 60000, Lines: []Line{{Service: "regular_visit", Qty: 4, ClaimedCents: 60000}}}
+	r = CheckBill(b, []Terms{lupeTerms("2026-01-14", 14000), first, corr}, cal, nil, loc)
+	got := readingSet(r.Lines[0].Readings)
+	if r.Lines[0].Status != StatusAmbiguous || len(r.Lines[0].Readings) != 2 || !got[56000] || !got[60000] || got[64000] {
+		t.Errorf("superseded correction: %s %+v", r.Lines[0].Status, r.Lines[0].Readings)
+	}
+}
+
+func TestCreditLineNeedsYourCall(t *testing.T) {
+	loc := NY()
+	cal, _ := Calendar("2026-09", []Day{"tue"}, loc)
+	b := Bill{HelperID: "lupe", Period: "2026-09", ClaimedTotalCents: 12000, Lines: []Line{
+		{Date: "2026-09-08", ClaimedCents: 14000}, {Service: "discount", ClaimedCents: -2000, Note: "-$20 discount"}}}
+	if errs := ValidateBill(b); len(errs) != 0 {
+		t.Fatalf("a credit line should be accepted: %v", errs)
+	}
+	r := CheckBill(b, lupeVersions(), cal, nil, loc)
+	if r.Lines[1].Status != StatusUnpriceable || !strings.Contains(r.Lines[1].Explanation, "confirm with the helper") {
+		t.Errorf("credit line: %s %s", r.Lines[1].Status, r.Lines[1].Explanation)
+	}
+	if len(r.PendingDecisions) != 1 || r.PendingDecisions[0].LineIndex != 1 || r.AgreedTotalCents != 14000 || !r.ArithmeticOK {
+		t.Errorf("credit decision: agreed %d arith %v %+v", r.AgreedTotalCents, r.ArithmeticOK, r.PendingDecisions)
+	}
+	b.Lines[0].Qty = -1
+	if errs := ValidateBill(b); len(errs) == 0 {
+		t.Errorf("a negative quantity is still refused")
+	}
+}

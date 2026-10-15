@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// priceable kinds price a bill line by its service; the others (multiplier,
+// adder, minimum, rounding) only modify hourly pricing.
+var priceable = map[RuleKind]bool{KindHourly: true, KindFlat: true, KindPerUnit: true, KindPerPeriod: true, KindFee: true, KindReimbursement: true}
+
 var knownKinds = map[RuleKind]bool{KindHourly: true, KindMultiplier: true, KindAdder: true, KindFlat: true, KindPerUnit: true,
 	KindMinimum: true, KindFee: true, KindReimbursement: true, KindPerPeriod: true, KindRounding: true}
 
@@ -27,6 +31,8 @@ func ValidateTerms(t Terms) []string {
 		errs = append(errs, "at least one rule is required")
 	}
 	seen := map[string]bool{}
+	svcKind := map[string]RuleKind{} // service → kind of the first priceable rule for it
+	singles := map[RuleKind]int{}    // minimum and rounding: at most one each
 	for i, r := range t.Rules {
 		at := fmt.Sprintf("rule %d (%s)", i+1, firstNonEmpty(r.Label, r.Service, string(r.Kind)))
 		if !knownKinds[r.Kind] {
@@ -51,6 +57,19 @@ func ValidateTerms(t Terms) []string {
 				}
 			}
 		}
+		if priceable[r.Kind] && r.Service != "" {
+			// several hourly rules may share a service (a base rate and an evening rate); anything else would be priced by whichever came first
+			if k, ok := svcKind[r.Service]; ok && (k != KindHourly || r.Kind != KindHourly) {
+				errs = append(errs, fmt.Sprintf("%s: service %q already has a %s rule; each service needs one way to price it", at, r.Service, k))
+			} else if !ok {
+				svcKind[r.Service] = r.Kind
+			}
+		}
+		if r.Kind == KindMinimum || r.Kind == KindRounding {
+			if singles[r.Kind]++; singles[r.Kind] > 1 {
+				errs = append(errs, fmt.Sprintf("%s: only one %s rule is allowed", at, r.Kind))
+			}
+		}
 		switch r.Kind {
 		case KindHourly:
 			if r.RateCents <= 0 {
@@ -69,6 +88,9 @@ func ValidateTerms(t Terms) []string {
 		case KindAdder:
 			if r.PerHourCents <= 0 {
 				errs = append(errs, at+": adder needs perHourCents > 0")
+			}
+			if r.Per == "" && (r.When == nil || r.When.IsEmpty()) {
+				errs = append(errs, at+": adder needs per (what it counts, e.g. extra_child) or a when")
 			}
 		case KindFlat:
 			if r.AmountCents <= 0 || r.Service == "" {
@@ -128,9 +150,10 @@ func ValidateBill(b Bill) []string {
 		if (l.Start == "") != (l.End == "") {
 			errs = append(errs, at+": start and end must both be given")
 		}
-		if l.ClaimedCents < 0 || l.Qty < 0 {
-			errs = append(errs, at+": negative amount or quantity")
+		if l.Qty < 0 {
+			errs = append(errs, at+": negative quantity")
 		}
+		// a negative amount is a credit ("-$20 discount"): accepted, and the engine puts it to Jordan
 	}
 	return errs
 }

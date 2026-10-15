@@ -67,12 +67,19 @@ func SpanOnDate(date string, start, end Clock, loc *time.Location) (Span, error)
 	if err != nil {
 		return Span{}, err
 	}
-	st := day.Add(time.Duration(sh)*time.Hour + time.Duration(sm)*time.Minute)
-	en := day.Add(time.Duration(eh)*time.Hour + time.Duration(em)*time.Minute)
+	st := clockOn(day, 0, sh, sm)
+	en := clockOn(day, 0, eh, em)
 	if !en.After(st) {
-		en = en.Add(24 * time.Hour)
+		en = clockOn(day, 1, eh, em)
 	}
 	return Span{Start: st, End: en}, nil
+}
+
+// clockOn is the wall-clock time h:m on day's date plus addDays, in day's zone.
+// Built with time.Date, never day.Add: on a daylight-saving day the hours since
+// midnight are not the clock time. 24:00 is the next midnight.
+func clockOn(day time.Time, addDays, h, m int) time.Time {
+	return time.Date(day.Year(), day.Month(), day.Day()+addDays, h, m, 0, 0, day.Location())
 }
 
 // SplitAtMidnight cuts a span into per-date pieces.

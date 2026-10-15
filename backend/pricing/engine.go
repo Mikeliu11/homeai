@@ -21,6 +21,9 @@ func PriceLine(l Line, t Terms, loc *time.Location) LineResult {
 	if errs := ValidateTerms(t); len(errs) > 0 {
 		return finish(res, nil, nil, "These terms have a problem and cannot be used for pricing: "+strings.Join(errs, "; "), StatusUnpriceable)
 	}
+	if l.ClaimedCents < 0 {
+		return finish(res, nil, nil, fmt.Sprintf("Credit line (%s, %s): no agreed rate prices a credit; confirm with the helper.", l.ClaimedCents, firstNonEmpty(l.Note, l.Service, "no description")), StatusUnpriceable)
+	}
 	ix := index(t)
 
 	svc := strings.TrimSpace(l.Service)
@@ -64,28 +67,51 @@ func PriceLine(l Line, t Terms, loc *time.Location) LineResult {
 		switch {
 		case hasSpan:
 			readings, err = ix.priceHourly(svc, span, l, true)
-		case l.Qty > 0 && l.Date != "":
-			// "4 hours, $88": no times, so no windows or multipliers can be judged; price at the base rate and say so.
-			base, e := ix.baseRate(svc)
+		case l.Qty > 0:
+			// "4 hours, $88" or an undated "12 hours @ $22": no clock times.
+			if l.Date != "" && l.Qty > 24 {
+				return finish(res, nil, nil, "More than 24 hours on one date; the line needs start and end times or one line per day.", StatusUnpriceable)
+			}
+			outside, inside, unjudged, e := ix.priceHours(svc, l, lineDate, loc)
 			if e != "" {
 				return finish(res, nil, nil, e, StatusUnpriceable)
 			}
-			mins := int(math.Round(l.Qty * 60))
-			amt := PerHour(base.RateCents).ForMinutes(mins)
-			readings = []Reading{{Service: svc, ExpectedCents: amt, Basis: []string{base.ID}, Explanation: fmt.Sprintf("%s × %s/hr = %s", minutesText(mins), base.RateCents, amt)}}
-			info = append(info, "No start and end times were given, so evening, Sunday or holiday rates could not be checked; priced at the base rate.")
+			if len(unjudged) == 0 {
+				readings = outside
+				break
+			}
+			what := "No start and end times were given"
+			if l.Date == "" {
+				what = "No date or times were given"
+			}
+			what += ", so these terms could not be checked: " + strings.Join(unjudged, "; ")
+			if l.Date != "" && len(outside) == 1 && l.ClaimedCents <= outside[0].ExpectedCents {
+				// billed no more than the hours cost without those rules: pay as billed, and say what was not checked
+				readings = outside
+				info = append(info, what+". Priced without them.")
+				break
+			}
+			all := dedupeReadings(append(append([]Reading{}, outside...), inside...))
+			var without, with []string
+			for _, rd := range outside {
+				without = append(without, fmt.Sprintf("%s (%s)", rd.ExpectedCents, rd.Explanation))
+			}
+			for _, rd := range inside {
+				with = append(with, fmt.Sprintf("%s (%s)", rd.ExpectedCents, rd.Explanation))
+			}
+			return needsCall(res, all, fmt.Sprintf("%s. Without them %s; if they covered every hour %s. Billed %s.", what,
+				joinOr(without), joinOr(with), l.ClaimedCents))
 		default:
-			return finish(res, nil, nil, "Hourly line without a date and start/end times (or a number of hours).", StatusUnpriceable)
+			return finish(res, nil, nil, "Hourly line without start/end times or a number of hours.", StatusUnpriceable)
 		}
 	case KindFlat:
 		if !hasSpan {
 			readings = []Reading{{Service: svc, ExpectedCents: primary[0].AmountCents, Basis: []string{primary[0].ID},
 				Explanation: fmt.Sprintf("%s: flat %s", niceName(primary[0]), primary[0].AmountCents)}}
-		} else {
-			readings, err = ix.priceFlat(primary[0], span, l)
-		}
-		if err == "" && !lineDate.IsZero() {
 			readings = ix.applyDateMultipliers(readings, lineDate)
+		} else {
+			// priceFlat applies the date multipliers itself: to the flat amount, while the overflow is priced hourly (which already applies them)
+			readings, err = ix.priceFlat(primary[0], span, l)
 		}
 	case KindPerUnit, KindPerPeriod:
 		r := primary[0]
@@ -106,19 +132,28 @@ func PriceLine(l Line, t Terms, loc *time.Location) LineResult {
 		}
 	case KindFee:
 		r := primary[0]
-		if ok, why := feeTriggered(r, l); !ok {
+		ok, why, unsure := feeTriggered(r, l)
+		if !ok {
 			return finish(res, nil, nil, why, StatusUnagreed)
 		}
 		exp := r.AmountCents
 		expl := fmt.Sprintf("%s: %s", niceName(r), r.AmountCents)
 		if r.PercentOfBooking > 0 {
-			if l.BookingCents == 0 {
-				return finish(res, nil, nil, fmt.Sprintf("%s is %v%% of the booking, but the booking amount is unknown.", niceName(r), r.PercentOfBooking), StatusUnpriceable)
+			booking, how := l.BookingCents, ""
+			if booking == 0 {
+				// price the cancelled booking from its times or hours, so the model never has to
+				booking, how = ix.bookingFromLine(l, span, hasSpan, lineDate, loc)
 			}
-			exp = Cents(math.Round(float64(l.BookingCents) * r.PercentOfBooking / 100))
-			expl = fmt.Sprintf("%s: %v%% of %s = %s", niceName(r), r.PercentOfBooking, l.BookingCents, exp)
+			if booking == 0 {
+				return finish(res, nil, nil, fmt.Sprintf("%s is %v%% of the booking, but the booking amount is unknown: the line needs the booked times or hours.", niceName(r), r.PercentOfBooking), StatusUnpriceable)
+			}
+			exp = Cents(math.Round(float64(booking) * r.PercentOfBooking / 100))
+			expl = fmt.Sprintf("%s: %v%% of %s%s = %s", niceName(r), r.PercentOfBooking, booking, how, exp)
 		}
 		readings = []Reading{{Service: svc, ExpectedCents: exp, Basis: []string{r.ID}, Explanation: expl}}
+		if unsure != "" {
+			return needsCall(res, readings, fmt.Sprintf("%s. %s Billed %s.", expl, unsure, l.ClaimedCents))
+		}
 	case KindReimbursement:
 		r := primary[0]
 		exp := l.ClaimedCents
@@ -137,6 +172,14 @@ func PriceLine(l Line, t Terms, loc *time.Location) LineResult {
 	if err != "" {
 		return finish(res, nil, nil, err, StatusUnpriceable)
 	}
+	// an adder counts units from the line's extras; extras listed under another name are not silently dropped
+	if len(l.Extras) > 0 && (primary[0].Kind == KindHourly || primary[0].Kind == KindFlat) {
+		for _, a := range ix.adders {
+			if _, ok := l.Extras[a.Per]; a.Per != "" && !ok {
+				info = append(info, fmt.Sprintf("%s counts %q, which this line does not give (it lists %s); it was not added.", firstNonEmpty(a.Label, "The adder"), a.Per, extrasText(l.Extras)))
+			}
+		}
+	}
 	res.Info = append(res.Info, info...)
 
 	// Alternative readings: other ways the same span could be priced under the terms.
@@ -145,7 +188,7 @@ func PriceLine(l Line, t Terms, loc *time.Location) LineResult {
 		for _, r := range t.Rules {
 			if r.Kind == KindFlat && r.Service != svc && flatFits(r, span) {
 				if rs, e := ix.priceFlat(r, span, l); e == "" && len(rs) == 1 {
-					alts = append(alts, ix.applyDateMultipliers(rs, lineDate)[0])
+					alts = append(alts, rs[0])
 				}
 			}
 		}
@@ -156,6 +199,17 @@ func PriceLine(l Line, t Terms, loc *time.Location) LineResult {
 		}
 	}
 	return finish(res, readings, alts, "", "")
+}
+
+// needsCall returns a line Jordan has to rule on: the engine can price it,
+// but something the line leaves open decides whether that price holds.
+func needsCall(res LineResult, readings []Reading, why string) LineResult {
+	res.Status = StatusAmbiguous
+	res.Readings = readings
+	res.ExpectedCents = readings[0].ExpectedCents
+	res.Basis = readings[0].Basis
+	res.Explanation = why
+	return res
 }
 
 // finish derives the status from the readings and the claimed amount.
@@ -193,7 +247,7 @@ func finish(res LineResult, readings, alts []Reading, msg string, forced Status)
 	for _, a := range alts {
 		if a.ExpectedCents < res.ExpectedCents && claimed > a.ExpectedCents {
 			res.Status = StatusAmbiguous
-			res.Explanation = fmt.Sprintf("%s. But read as a %s it would be %s (%s). Billed %s.", readings[0].Explanation, humanize(a.Service), a.ExpectedCents, a.Explanation, claimed)
+			res.Explanation = fmt.Sprintf("%s. But read as %s it would be %s (%s). Billed %s.", readings[0].Explanation, withArticle(humanize(a.Service)), a.ExpectedCents, a.Explanation, claimed)
 		} else {
 			res.Info = append(res.Info, fmt.Sprintf("Read as %s this would be %s (%s), which is more.", withArticle(humanize(a.Service)), a.ExpectedCents, a.Explanation))
 		}
@@ -283,27 +337,32 @@ func countable(unit string) bool {
 	return false
 }
 
-func feeTriggered(r Rule, l Line) (bool, string) {
+// feeTriggered says whether a fee's trigger is met. unsure is set when the
+// line leaves the trigger open (a cancellation with no notice period stated).
+func feeTriggered(r Rule, l Line) (ok bool, why, unsure string) {
 	if r.Trigger == nil {
-		return true, ""
+		return true, "", ""
 	}
 	name := firstNonEmpty(r.Label, r.Service)
 	switch {
 	case r.Trigger.SameDay && !l.Flags["same_day"]:
-		return false, fmt.Sprintf("%s applies only to same-day bookings; this line is not marked same-day.", name)
+		return false, fmt.Sprintf("%s applies only to same-day bookings; this line is not marked same-day.", name), ""
 	case r.Trigger.CancelledWithinHours > 0:
 		if !l.Flags["cancelled"] {
-			return false, fmt.Sprintf("%s applies only to cancellations within %d hours; this line is not a cancellation.", name, r.Trigger.CancelledWithinHours)
+			return false, fmt.Sprintf("%s applies only to cancellations within %d hours; this line is not a cancellation.", name, r.Trigger.CancelledWithinHours), ""
 		}
-		if l.NoticeHours > float64(r.Trigger.CancelledWithinHours) {
-			return false, fmt.Sprintf("%s applies to cancellations within %d hours; this one had %s hours of notice.", name, r.Trigger.CancelledWithinHours, trimFloat(l.NoticeHours))
+		if l.NoticeHours == nil {
+			return true, "", fmt.Sprintf("The notice period was not stated, so whether it was inside %d hours could not be checked.", r.Trigger.CancelledWithinHours)
+		}
+		if *l.NoticeHours > float64(r.Trigger.CancelledWithinHours) {
+			return false, fmt.Sprintf("%s applies to cancellations within %d hours; this one had %s hours of notice.", name, r.Trigger.CancelledWithinHours, trimFloat(*l.NoticeHours)), ""
 		}
 	case r.Trigger.Holiday:
 		if _, ok := USFederalHolidays(yearOf(l.Date))[l.Date]; !ok {
-			return false, fmt.Sprintf("%s applies only on holidays; %s is not one.", name, l.Date)
+			return false, fmt.Sprintf("%s applies only on holidays; %s is not one.", name, l.Date), ""
 		}
 	}
-	return true, ""
+	return true, "", ""
 }
 
 // ---- index ----
@@ -321,7 +380,7 @@ func index(t Terms) ruleIndex {
 	ix := ruleIndex{byService: map[string][]Rule{}, hourly: map[string][]Rule{}}
 	for i := range t.Rules {
 		r := t.Rules[i]
-		if r.Service != "" {
+		if r.Service != "" && priceable[r.Kind] {
 			ix.byService[r.Service] = append(ix.byService[r.Service], r)
 		}
 		switch r.Kind {
@@ -366,7 +425,7 @@ func (ix ruleIndex) applyDateMultipliers(readings []Reading, date time.Time) []R
 	}
 	var ms []Rule
 	for _, m := range ix.mults {
-		if m.When != nil && m.When.IsDateOnly() && m.When.Matches(date.Add(12*time.Hour)) {
+		if m.When != nil && m.When.IsDateOnly() && m.When.Matches(clockOn(date, 0, 12, 0)) {
 			ms = append(ms, m)
 		}
 	}
@@ -446,6 +505,42 @@ func ids(rs []Rule) string {
 // runs with the same applicable rules. Returns one reading, or two when
 // stacking is a genuine question (a windowed rate and a multiplier both
 // apply, or two multipliers apply).
+func sameRate(rs []Rule) bool {
+	for _, r := range rs[1:] {
+		if r.RateCents != rs[0].RateCents {
+			return false
+		}
+	}
+	return true
+}
+
+// bookingFromLine prices what a cancelled booking would have cost, from the
+// line's times or hours, using the helper's hourly rate (minimum included).
+func (ix ruleIndex) bookingFromLine(l Line, span Span, hasSpan bool, date time.Time, loc *time.Location) (Cents, string) {
+	svc := ""
+	if len(ix.hourly["hourly"]) > 0 {
+		svc = "hourly"
+	} else if len(ix.hourly) == 1 {
+		for k := range ix.hourly {
+			svc = k
+		}
+	}
+	if svc == "" {
+		return 0, ""
+	}
+	var rs []Reading
+	switch {
+	case hasSpan:
+		rs, _ = ix.priceHourly(svc, span, l, true)
+	case l.Qty > 0:
+		rs, _, _, _ = ix.priceHours(svc, l, date, loc)
+	}
+	if len(rs) == 0 || rs[0].ExpectedCents <= 0 {
+		return 0, ""
+	}
+	return rs[0].ExpectedCents, " (the booking: " + rs[0].Explanation + ")"
+}
+
 func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool) ([]Reading, string) {
 	if len(ix.hourly[svc]) == 0 {
 		return nil, fmt.Sprintf("No hourly rate agreed for %s.", svc)
@@ -453,9 +548,8 @@ func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool
 	if _, e := ix.baseRate(svc); e != "" && !hasOnlyWindowed(ix.hourly[svc]) {
 		return nil, e
 	}
-	origMinutes := span.Minutes()
 	if ix.rounding != nil && ix.rounding.Minutes > 0 {
-		if rem := origMinutes % ix.rounding.Minutes; rem != 0 {
+		if rem := span.Minutes() % ix.rounding.Minutes; rem != 0 {
 			span.End = span.End.Add(time.Duration(ix.rounding.Minutes-rem) * time.Minute)
 		}
 	}
@@ -474,6 +568,9 @@ func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool
 				sig.spec = append(sig.spec, h)
 			}
 		}
+		if len(sig.spec) > 1 && sameRate(sig.spec) {
+			sig.spec = sig.spec[:1] // same rate written twice: one run, one explanation line
+		}
 		if n := len(runs); n > 0 && ids(runs[n-1].spec) == ids(sig.spec) && ids(runs[n-1].mults) == ids(sig.mults) && ids(runs[n-1].adders) == ids(sig.adders) {
 			runs[n-1].minutes++
 			continue
@@ -488,7 +585,12 @@ func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool
 	differs := false
 	for _, r := range runs {
 		if len(r.spec) > 1 {
-			return nil, fmt.Sprintf("Two hourly rates both apply at %s (%s); the terms need to say which wins.", r.start.Format("Mon 15:04"), ids(r.spec))
+			// "$28 after 10pm" and "$28 after 11pm" written as two rules: the same
+			// rate either way, so there is nothing to decide. Different rates are a conflict.
+			if !sameRate(r.spec) {
+				return nil, fmt.Sprintf("Two hourly rates both apply at %s (%s); the terms need to say which wins.", r.start.Format("Mon 15:04"), ids(r.spec))
+			}
+			r.spec = r.spec[:1]
 		}
 		var base PerHour
 		var baseLabel string
@@ -513,9 +615,10 @@ func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool
 			basis[m.ID] = true
 		}
 		hrs := fmt.Sprintf("%s × ", minutesText(r.minutes))
-		// stacked: every multiplier on the applicable (windowed or base) rate
+		// stacked: every multiplier on the applicable (windowed or base) rate.
+		// Amounts are rate × factor × minutes rounded once; the shown rate is rounded for display only.
 		sRate := rate.Times(product)
-		sAmt := sRate.ForMinutes(r.minutes)
+		sAmt := rate.TimesForMinutes(product, r.minutes)
 		sExpl := hrs + fmt.Sprintf("%s/hr", Cents(sRate))
 		if len(r.spec) == 1 {
 			sExpl += " (" + label + ")"
@@ -524,28 +627,26 @@ func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool
 			sExpl = hrs + fmt.Sprintf("%s/hr (%s ×%s, %s)", Cents(sRate), Cents(rate), trimFloat(product), strings.Join(mlabels, ", "))
 		}
 		// exclusive: the single largest effect, nothing stacked
-		eRate, eExpl := sRate, sExpl
+		eAmt, eExpl := sAmt, sExpl
 		if len(r.mults) > 0 && (len(r.spec) == 1 && len(r.base) > 0 || len(r.mults) > 1) {
 			differs = true
-			candidates := []struct {
-				rate PerHour
-				expl string
-			}{{rate, hrs + fmt.Sprintf("%s/hr (%s)", Cents(rate), label)}}
-			_ = baseLabel
-			if len(r.base) > 0 {
-				candidates = append(candidates, struct {
-					rate PerHour
-					expl string
-				}{base.Times(maxF), hrs + fmt.Sprintf("%s/hr (%s ×%s, largest of %s)", Cents(base.Times(maxF)), baseLabel, trimFloat(maxF), strings.Join(mlabels, ", "))})
+			type candidate struct {
+				rate   PerHour
+				factor float64
+				expl   string
 			}
-			eRate, eExpl = candidates[0].rate, candidates[0].expl
+			candidates := []candidate{{rate, 1, hrs + fmt.Sprintf("%s/hr (%s)", Cents(rate), label)}}
+			if len(r.base) > 0 {
+				candidates = append(candidates, candidate{base, maxF, hrs + fmt.Sprintf("%s/hr (%s ×%s, largest of %s)", Cents(base.Times(maxF)), baseLabel, trimFloat(maxF), strings.Join(mlabels, ", "))})
+			}
+			best := candidates[0]
 			for _, c := range candidates[1:] {
-				if c.rate > eRate {
-					eRate, eExpl = c.rate, c.expl
+				if float64(c.rate)*c.factor > float64(best.rate)*best.factor {
+					best = c
 				}
 			}
+			eAmt, eExpl = best.rate.TimesForMinutes(best.factor, r.minutes), best.expl
 		}
-		eAmt := eRate.ForMinutes(r.minutes)
 		for _, a := range r.adders {
 			units := 1.0
 			if a.Per != "" {
@@ -568,7 +669,8 @@ func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool
 	}
 	if applyMinimum && ix.minimum != nil {
 		m := ix.minimum
-		if m.Hours > 0 && float64(origMinutes) < m.Hours*60 && origMinutes > 0 {
+		// judged on the rounded booking, and only ever scaled up
+		if m.Hours > 0 && span.Minutes() > 0 && float64(span.Minutes()) < m.Hours*60 {
 			// scale the priced booking up to the minimum length, keeping its rates and multipliers
 			f := m.Hours * 60 / float64(span.Minutes())
 			stacked = Cents(math.Round(float64(stacked) * f))
@@ -578,9 +680,13 @@ func (ix ruleIndex) priceHourly(svc string, span Span, l Line, applyMinimum bool
 			basis[m.ID] = true
 		}
 		if m.AmountCents > 0 && stacked < m.AmountCents {
-			stacked, exclusive = m.AmountCents, m.AmountCents
+			stacked = m.AmountCents
 			stackedExpl = []string{fmt.Sprintf("minimum charge %s", m.AmountCents)}
-			exclusiveExpl = stackedExpl
+			basis[m.ID] = true
+		}
+		if m.AmountCents > 0 && exclusive < m.AmountCents {
+			exclusive = m.AmountCents
+			exclusiveExpl = []string{fmt.Sprintf("minimum charge %s", m.AmountCents)}
 			basis[m.ID] = true
 		}
 	}
@@ -613,13 +719,15 @@ func (ix ruleIndex) priceFlat(r Rule, span Span, l Line) ([]Reading, string) {
 	covStart, covEnd := span.Start, span.End
 	if r.From != "" {
 		h, m, _ := parseClock(r.From)
-		covStart = day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
+		covStart = clockOn(day, 0, h, m)
 	}
 	if r.Until != "" {
 		h, m, _ := parseClock(r.Until)
-		covEnd = day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
-		if !covEnd.After(covStart) {
-			covEnd = covEnd.Add(24 * time.Hour)
+		covEnd = clockOn(day, 0, h, m)
+		// only a package with a start can run past midnight ("21:00 until 07:00");
+		// with only an end, a booking that starts after it is not covered
+		if r.From != "" && !covEnd.After(covStart) {
+			covEnd = clockOn(day, 1, h, m)
 		}
 	}
 	in := Span{Start: maxT(covStart, span.Start), End: minT(covEnd, span.End)}
@@ -633,13 +741,20 @@ func (ix ruleIndex) priceFlat(r Rule, span Span, l Line) ([]Reading, string) {
 	if span.End.After(in.End) {
 		out = append(out, Span{in.End, span.End})
 	}
-	total := r.AmountCents
 	expl := fmt.Sprintf("%s: flat %s", niceName(r), r.AmountCents)
 	if r.Until != "" {
 		expl += " until " + clock12(r.Until)
 	}
-	basis := []string{r.ID}
+	// Sunday/holiday multipliers scale the flat amount here; the overflow below
+	// is priced hourly, which applies them on its own. Two matching multipliers
+	// give a stacked and a not-stacked flat amount.
+	flat := ix.applyDateMultipliers([]Reading{{Service: r.Service, ExpectedCents: r.AmountCents, Basis: []string{r.ID}, Explanation: expl}}, day)
+	total, expl, basis := flat[0].ExpectedCents, flat[0].Explanation, flat[0].Basis
+	alone := flat[len(flat)-1] // the not-stacked flat amount (the same as flat[0] with at most one multiplier)
 	var extra []Reading
+	if len(flat) > 1 && len(out) == 0 {
+		extra = append(extra, alone)
+	}
 	if len(out) > 0 {
 		if len(ix.hourly["hourly"]) == 0 {
 			return nil, fmt.Sprintf("%s of this line fall outside %s and no hourly rate is agreed.", minutesText(sumMinutes(out)), niceName(r))
@@ -664,8 +779,8 @@ func (ix ruleIndex) priceFlat(r Rule, span Span, l Line) ([]Reading, string) {
 				ex = append(ex, rs[0].Explanation)
 			}
 		}
-		if differs {
-			extra = append(extra, Reading{Service: r.Service, ExpectedCents: total + exclusive, Basis: basis, Explanation: expl + ", plus " + strings.Join(ex, "; ")})
+		if differs || len(flat) > 1 {
+			extra = append(extra, Reading{Service: r.Service, ExpectedCents: alone.ExpectedCents + exclusive, Basis: basis, Explanation: alone.Explanation + ", plus " + strings.Join(ex, "; ")})
 		}
 		total += stacked
 		expl += ", plus " + strings.Join(sx, "; ")
@@ -684,10 +799,10 @@ func flatFits(r Rule, span Span) bool {
 		if err != nil {
 			return false
 		}
-		until := day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
+		until := clockOn(day, 0, h, m)
 		if r.From != "" {
 			if fh, fm, err := parseClock(r.From); err == nil && fh*60+fm > h*60+m {
-				until = until.Add(24 * time.Hour)
+				until = clockOn(day, 1, h, m)
 			}
 		}
 		if span.End.Before(until.Add(-60 * time.Minute)) {
@@ -699,12 +814,134 @@ func flatFits(r Rule, span Span) bool {
 		if err != nil {
 			return false
 		}
-		from := day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
+		from := clockOn(day, 0, h, m)
 		if span.Start.After(from.Add(60 * time.Minute)) {
 			return false
 		}
 	}
 	return true
+}
+
+// priceHours prices an hourly line given as a number of hours with no clock
+// times. The hours are priced as a span from midnight on the line's date, so
+// everything the date decides (Sunday and holiday multipliers, date-only
+// rates) and everything the length decides (minimum, rounding, adders) applies.
+// Rules the line cannot be judged by (clock windows such as "after 10pm"; with
+// no date, every window) are left out of outside and taken to cover every hour
+// in inside; unjudged names them. inside is empty when nothing was unjudged.
+func (ix ruleIndex) priceHours(svc string, l Line, date time.Time, loc *time.Location) (outside, inside []Reading, unjudged []string, err string) {
+	unknown := func(w *Window) bool {
+		if w == nil || w.IsEmpty() {
+			return false
+		}
+		return date.IsZero() || w.From != "" || w.To != ""
+	}
+	strip := func(w *Window) *Window {
+		if date.IsZero() {
+			return nil
+		}
+		c := *w
+		c.From, c.To = "", ""
+		if c.IsEmpty() {
+			return nil
+		}
+		return &c
+	}
+	seen := map[string]bool{}
+	note := func(r Rule) {
+		if n := niceName(r); !seen[n] {
+			seen[n] = true
+			unjudged = append(unjudged, n)
+		}
+	}
+	out, in := ix, ix
+	out.hourly, in.hourly = map[string][]Rule{}, map[string][]Rule{}
+	out.mults, in.mults, out.adders, in.adders = nil, nil, nil, nil
+	promoted := false
+	for _, h := range ix.hourly[svc] {
+		if !unknown(h.When) {
+			out.hourly[svc] = append(out.hourly[svc], h)
+			continue
+		}
+		note(h)
+		h.When = strip(h.When)
+		promoted = promoted || h.When == nil
+		in.hourly[svc] = append(in.hourly[svc], h)
+	}
+	for _, h := range out.hourly[svc] {
+		// an evening rate taken as covering every hour replaces the base rate
+		if !promoted || (h.When != nil && !h.When.IsEmpty()) {
+			in.hourly[svc] = append(in.hourly[svc], h)
+		}
+	}
+	for _, m := range ix.mults {
+		if unknown(m.When) {
+			note(m)
+			m.When = strip(m.When)
+			in.mults = append(in.mults, m)
+		} else {
+			out.mults = append(out.mults, m)
+			in.mults = append(in.mults, m)
+		}
+	}
+	for _, a := range ix.adders {
+		if unknown(a.When) {
+			note(a)
+			a.When = strip(a.When)
+			in.adders = append(in.adders, a)
+		} else {
+			out.adders = append(out.adders, a)
+			in.adders = append(in.adders, a)
+		}
+	}
+	day := date
+	if day.IsZero() {
+		day = time.Date(2001, 1, 2, 0, 0, 0, 0, loc) // any date: with no date every dated rule was set aside above
+	}
+	span := Span{Start: day, End: day.Add(time.Duration(math.Round(l.Qty*60)) * time.Minute)}
+	outside, e1 := out.priceHourly(svc, span, l, true)
+	if len(unjudged) > 0 {
+		var e2 string
+		if inside, e2 = in.priceHourly(svc, span, l, true); e2 != "" {
+			inside = nil
+		}
+	}
+	if e1 != "" {
+		if len(inside) == 0 {
+			return nil, nil, nil, e1
+		}
+		return nil, inside, unjudged, "" // only windowed rates are agreed: nothing prices the hours without them
+	}
+	return outside, inside, unjudged, ""
+}
+
+func extrasText(ex map[string]float64) string {
+	ks := make([]string, 0, len(ex))
+	for k, v := range ex {
+		ks = append(ks, fmt.Sprintf("%s: %s", k, trimFloat(v)))
+	}
+	sort.Strings(ks)
+	return strings.Join(ks, ", ")
+}
+
+// dedupeReadings drops readings with the same amount as an earlier one.
+func dedupeReadings(rs []Reading) []Reading {
+	seen := map[Cents]bool{}
+	var out []Reading
+	for _, r := range rs {
+		if !seen[r.ExpectedCents] {
+			seen[r.ExpectedCents] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func joinOr(parts []string) string {
+	if len(parts) == 0 {
+		return "no agreed rate applies"
+	}
+	return strings.Join(parts, " or ")
 }
 
 // ---- helpers ----

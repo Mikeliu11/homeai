@@ -9,20 +9,33 @@ type Attachment = { source: Source; preview?: string; name: string };
 
 function newId() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
+// The model accepts PNG/JPEG/WebP/GIF up to about 3.75 MB with no side over 8000 px.
+// Anything else (HEIC, a huge photo, a tall stitched screenshot) is redrawn as JPEG,
+// keeping as many pixels as allowed so the text stays readable.
 async function toUploadable(file: File): Promise<{ blob: Blob; type: string }> {
   const ok = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-  if (ok.includes(file.type) && file.size < 3_500_000) return { blob: file, type: file.type };
-  // HEIC or oversize: draw to a canvas and export JPEG
   const bmp = await createImageBitmap(file).catch(() => null);
-  if (!bmp) throw new Error(`Can't read ${file.name}. Use PNG or JPEG.`);
-  const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+  if (!bmp) {
+    if (ok.includes(file.type) && file.size < 3_500_000) return { blob: file, type: file.type };
+    throw new Error(`Can't read ${file.name}. Use PNG or JPEG.`);
+  }
+  const side = Math.max(bmp.width, bmp.height);
+  if (ok.includes(file.type) && file.size < 3_500_000 && side <= 7500) return { blob: file, type: file.type };
+  const maxSide = file.size < 3_500_000 ? 7500 : 2400;
+  const scale = Math.min(1, maxSide / side);
   const canvas = document.createElement("canvas");
   canvas.width = Math.round(bmp.width * scale); canvas.height = Math.round(bmp.height * scale);
   canvas.getContext("2d")!.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise<Blob | null>(r => canvas.toBlob(r, "image/jpeg", 0.9));
+  let blob = await new Promise<Blob | null>(r => canvas.toBlob(r, "image/jpeg", 0.9));
+  if (blob && blob.size >= 3_500_000) blob = await new Promise<Blob | null>(r => canvas.toBlob(r, "image/jpeg", 0.7));
   if (!blob) throw new Error("Could not convert the image");
   return { blob, type: "image/jpeg" };
 }
+
+// keepAsSource mirrors send(): text that looks like a message, note or bill is
+// stored as a source of its own, so one of the turn's sourceIds is the text itself.
+function keepAsSource(body: string) { return body.length > 60 || /\n|\$|\d/.test(body); }
+function attachmentCount(t: Turn) { return (t.sourceIds?.length ?? 0) - (t.userText && keepAsSource(t.userText) ? 1 : 0); }
 
 export default function Home() {
   const [sessionId, setSessionId] = useState(() => { try { return localStorage.getItem("hp.session") || newId(); } catch { return newId(); } });
@@ -91,7 +104,7 @@ export default function Home() {
   }
 
   async function send() {
-    if (busy) return;
+    if (busy || uploading > 0) return; // Enter must not send while a screenshot is still uploading
     const body = text.trim();
     if (!body && !attachments.length) return;
     setBusy(true); setErr("");
@@ -99,7 +112,7 @@ export default function Home() {
       const sourceIds = attachments.map(a => a.source.id);
       // anything that looks like a message, note or bill is kept as a source for provenance;
       // the text is sent too so the conversation shows Jordan's own words
-      if (body.length > 60 || /\n|\$|\d/.test(body)) {
+      if (keepAsSource(body)) {
         const { source } = await api.upload({ kind: "text", text: body });
         sourceIds.unshift(source.id);
       }
@@ -130,7 +143,7 @@ export default function Home() {
           )}
           {turns.map(t => (
             <div key={t.id} className="stack">
-              {(t.userText || t.sourceIds?.length) ? <div className="msg user">{t.userText || "(attachment)"}{(t.sourceIds?.length ?? 0) > (t.userText ? 1 : 0) || (!t.userText && t.sourceIds?.length) ? <div className="attach">📎 {t.sourceIds!.length - (t.userText ? 1 : 0) || t.sourceIds!.length} attachment{(t.sourceIds!.length - (t.userText ? 1 : 0)) > 1 ? "s" : ""}</div> : null}</div> : null}
+              {(t.userText || t.sourceIds?.length) ? <div className="msg user">{t.userText || "(attachment)"}{attachmentCount(t) > 0 ? <div className="attach">📎 {attachmentCount(t)} attachment{attachmentCount(t) > 1 ? "s" : ""}</div> : null}</div> : null}
               {t.status === "queued" || t.status === "running" ? <div className="msg system">… {t.progress || "thinking"}</div> : null}
               {t.status === "failed" ? <div className="msg assistant error">{t.error || "Something went wrong."}</div> : null}
               {t.status === "done" && <div className="msg assistant"><Markdown text={t.reply ?? ""} /></div>}
@@ -142,9 +155,9 @@ export default function Home() {
         <div className="card stack" onDragOver={e => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)} onDrop={e => { e.preventDefault(); setOver(false); addFiles(e.dataTransfer.files); }}>
           <textarea value={text} onChange={e => setText(e.target.value)} placeholder="Paste a text thread, an email, or type what you remember… (Enter to send, Shift+Enter for a new line)"
             onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
-          {attachments.length > 0 && <div className="row">{attachments.map(a => <span key={a.source.id} className="row small">{a.preview && <img className="thumb" src={a.preview} alt={a.name} />}{a.name}<button className="link" onClick={() => setAttachments(x => x.filter(y => y.source.id !== a.source.id))}>✕</button></span>)}</div>}
+          {attachments.length > 0 && <div className="row">{attachments.map(a => <span key={a.source.id} className="row small">{a.preview && <img className="thumb" src={a.preview} alt={a.name} />}{a.name}<button className="link" aria-label={`Remove ${a.name}`} onClick={() => setAttachments(x => x.filter(y => y.source.id !== a.source.id))}>✕</button></span>)}</div>}
           <div className="row">
-            <div className={`dropzone grow ${over ? "over" : ""}`} onClick={() => fileRef.current?.click()}>{uploading > 0 ? `Uploading ${uploading} screenshot${uploading > 1 ? "s" : ""}…` : "Drop screenshots here or click to choose (PNG or JPEG)"}</div>
+            <div className={`dropzone grow ${over ? "over" : ""}`} role="button" tabIndex={0} onClick={() => fileRef.current?.click()} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileRef.current?.click(); } }}>{uploading > 0 ? `Uploading ${uploading} screenshot${uploading > 1 ? "s" : ""}…` : "Drop screenshots here or click to choose (PNG or JPEG)"}</div>
             <input ref={fileRef} type="file" accept="image/*" multiple hidden onChange={e => e.target.files && addFiles(e.target.files)} />
             <button className="primary" disabled={busy || uploading > 0 || (!text.trim() && !attachments.length)} onClick={send}>{busy ? "Sending…" : uploading > 0 ? "Uploading…" : "Send"}</button>
           </div>

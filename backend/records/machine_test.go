@@ -383,3 +383,100 @@ func TestMemStoreResetClearsAll(t *testing.T) {
 		t.Fatalf("not empty: %d %d %d %d %d", len(hs), len(bs), len(ps), len(ts), len(as))
 	}
 }
+
+func TestDoubleConfirmWritesOnce(t *testing.T) {
+	ctx := context.Background()
+	m, st := newMachine()
+	p, _ := m.ProposeTerms(ctx, "turn1:0", "agent", lupeTermsP("2026-01-14", 14000))
+	if _, err := m.ConfirmTerms(ctx, p.ID, p.ContentHash, "jordan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ConfirmTerms(ctx, p.ID, p.ContentHash, "jordan"); !errors.Is(err, ErrProposalClosed) {
+		t.Fatalf("second confirm: want proposal closed, got %v", err)
+	}
+	hs, _ := st.ListHelpers(ctx)
+	if len(hs) != 1 {
+		t.Fatalf("want one Lupe, got %d", len(hs))
+	}
+	vs, _ := st.ListTermsVersions(ctx, hs[0].ID)
+	if len(vs) != 1 {
+		t.Fatalf("want one terms version, got %d", len(vs))
+	}
+	// a bill confirmed twice is one bill
+	bp, _ := m.ProposeBill(ctx, "turn2:0", "agent", lupeBillP(hs[0].ID))
+	if _, err := m.ConfirmBill(ctx, bp.ID, bp.ContentHash, "jordan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ConfirmBill(ctx, bp.ID, bp.ContentHash, "jordan"); !errors.Is(err, ErrProposalClosed) {
+		t.Fatalf("second bill confirm: want proposal closed, got %v", err)
+	}
+	if bills, _ := st.ListBills(ctx, hs[0].ID); len(bills) != 1 {
+		t.Fatalf("want one bill, got %d", len(bills))
+	}
+}
+
+func TestEditRefusedBeforeOriginalIsClosed(t *testing.T) {
+	ctx := context.Background()
+	m, st := newMachine()
+	p, _ := m.ProposeTerms(ctx, "turn1:0", "agent", lupeTermsP("2026-01-14", 14000))
+	v, _ := m.ConfirmTerms(ctx, p.ID, p.ContentHash, "jordan")
+	bp, _ := m.ProposeBill(ctx, "turn2:0", "agent", lupeBillP(v.HelperID))
+	rec, _ := m.ConfirmBill(ctx, bp.ID, bp.ContentHash, "jordan")
+	// a second September card arrives while the bill is still open ...
+	again, err := m.ProposeBill(ctx, "turn3:0", "agent", lupeBillP(v.HelperID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ... then Jordan approves the bill, and later edits that card: the month is
+	// locked, so the edit is refused and the card stays open (not a dead "edited" stub)
+	if _, err := m.Approve(ctx, rec.ID, rec.ContentHashForConfirm(), Approval{Note: "ok", AmountCents: 80000, Method: "Zelle", By: "jordan"}); err != nil {
+		t.Fatal(err)
+	}
+	edited := lupeBillP(v.HelperID)
+	edited.Bill.Lines[0].ClaimedCents = 14000
+	if _, err := m.EditBillProposal(ctx, again.ID, edited, "jordan"); !errors.Is(err, ErrAlreadyApproved) {
+		t.Fatalf("want already approved, got %v", err)
+	}
+	if got, _ := st.GetProposal(ctx, again.ID); got.Status != "open" {
+		t.Fatalf("original should stay open, got %s", got.Status)
+	}
+}
+
+func TestReplaceMoneyWholeAmountsOnly(t *testing.T) {
+	got := replaceMoney("$30/hr, $300 monthly cap, $30.50 extra, ($30)", 3000, 3200)
+	want := "$32/hr, $300 monthly cap, $30.50 extra, ($32)"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestAgentCardNeverSupersedesUserEdit(t *testing.T) {
+	ctx := context.Background()
+	m, st := newMachine()
+	p, _ := m.ProposeTerms(ctx, "turn1:0", "agent", lupeTermsP("2026-01-14", 14000))
+	edited := lupeTermsP("2026-01-14", 14500)
+	np, err := m.EditTermsProposal(ctx, p.ID, edited, "jordan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the model proposes the same helper and date again from the original thread
+	if _, err := m.ProposeTerms(ctx, "turn2:0", "agent", lupeTermsP("2026-01-14", 14000)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetProposal(ctx, np.ID); got.Status != "open" {
+		t.Fatalf("Jordan's edited card should stay open, got %s", got.Status)
+	}
+}
+
+func TestApproveRefusesNegativeAmount(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newMachine()
+	p, _ := m.ProposeTerms(ctx, "turn1:0", "agent", lupeTermsP("2026-01-14", 14000))
+	v, _ := m.ConfirmTerms(ctx, p.ID, p.ContentHash, "jordan")
+	bp, _ := m.ProposeBill(ctx, "turn2:0", "agent", lupeBillP(v.HelperID))
+	rec, _ := m.ConfirmBill(ctx, bp.ID, bp.ContentHash, "jordan")
+	_, err := m.Approve(ctx, rec.ID, rec.ContentHashForConfirm(), Approval{AmountCents: -5000, Note: "dispute", Method: "Zelle", By: "jordan"})
+	if !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("want refusal, got %v", err)
+	}
+}

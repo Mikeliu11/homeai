@@ -2,6 +2,7 @@ package pricing
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -28,7 +29,7 @@ func Calendar(period string, usual []Day, loc *time.Location) (CalendarFacts, er
 		Holidays: map[string]string{}, UsualDayNames: usual}
 	usualSet := map[Day]bool{}
 	for _, d := range usual {
-		usualSet[d] = true
+		usualSet[normDay(d)] = true
 	}
 	for d := start; d.Before(end); d = d.AddDate(0, 0, 1) {
 		ds := d.Format("2006-01-02")
@@ -87,5 +88,18 @@ func USFederalHolidays(year int) map[string]string {
 	fixed(time.November, 11, "Veterans Day")
 	nth(time.November, time.Thursday, 4, "Thanksgiving Day")
 	fixed(time.December, 25, "Christmas Day")
+	// next New Year's Day on a Saturday is observed on this year's Dec 31
+	if ny := time.Date(year+1, time.January, 1, 0, 0, 0, 0, time.UTC); ny.Weekday() == time.Saturday {
+		out[fmt.Sprintf("%d-12-31", year)] = "New Year's Day (observed)"
+	}
 	return out
+}
+
+// normDay reads "Tue", "TUE" or "Tuesday" as "tue".
+func normDay(d Day) Day {
+	s := strings.ToLower(strings.TrimSpace(string(d)))
+	if len(s) > 3 {
+		s = s[:3]
+	}
+	return Day(s)
 }

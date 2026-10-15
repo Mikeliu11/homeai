@@ -47,10 +47,11 @@ func main() {
 	m := &records.Machine{Store: st, Loc: loc, Now: time.Now}
 	blobs := agent.NewLocalBlobs()
 	mem := agent.NewLocalMemory()
-	runner := &agent.Runner{Deps: agent.Deps{Store: st, Machine: m, Blobs: blobs, Memory: mem, LLM: agent.ScriptedLLM{}, Loc: loc, Now: time.Now, Actor: "jordan"}}
+	deps := agent.Deps{Store: st, Machine: m, Blobs: blobs, Memory: mem, LLM: agent.ScriptedLLM{}, Loc: loc, Now: time.Now, Actor: "jordan"}
 	srv := &api.Server{Store: st, Machine: m, Uploads: localUploads{base, blobs}, Memory: mem, Now: time.Now, StaleAfter: 5 * time.Minute,
 		Invoker: localInvoker{run: func(id string) {
-			time.Sleep(400 * time.Millisecond) // let the UI see "queued"
+			time.Sleep(400 * time.Millisecond)  // let the UI see "queued"
+			runner := &agent.Runner{Deps: deps} // one runner per turn: its card list is per turn
 			if err := runner.RunTurn(context.Background(), id); err != nil {
 				log.Printf("turn %s: %v", id, err)
 			}

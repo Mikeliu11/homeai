@@ -25,7 +25,7 @@ export default function HelperDetail() {
         <h1 style={{ margin: 0 }}>{helper.name}</h1>
         <span className="badge">{helper.role}</span>
         {helper.payMethod && <span className="badge">paid by {helper.payMethod}</span>}
-        {helper.usualDays?.length ? <span className="badge">usually {helper.usualDays.map(d => d[0].toUpperCase() + d.slice(1)).join(", ")}</span> : null}
+        {helper.usualDays?.length ? <span className="badge">usually {helper.usualDays.map(d => (d[0] ?? "").toUpperCase() + d.slice(1)).join(", ")}</span> : null}
       </div>
 
       {proposals.length > 0 && (

@@ -26,7 +26,9 @@ export function ApproveDialog({ bill, helper, onClose, onApprove, busy, error }:
     }
     return amt;
   }, [check, decisions, bill]);
-  const typedCents = typed ? parseMoney(typed) : null;
+  // a typed amount must be a positive number: the server reads 0 as "not given"
+  const parsed = typed ? parseMoney(typed) : null;
+  const typedCents = parsed !== null && parsed > 0 ? parsed : null;
   const differs = typedCents !== null && typedCents !== computed;
   const amount = typed ? typedCents : computed;
   const canApprove = allDecided && method.trim() !== "" && (typed === "" || typedCents !== null)
@@ -71,7 +73,7 @@ export function ApproveDialog({ bill, helper, onClose, onApprove, busy, error }:
         <div className="row" style={{ alignItems: "flex-start" }}>
           <div className="grow"><label>Amount <span className="muted small">(blank = {money(computed)})</span></label>
             <input value={typed} placeholder={money(computed)} onChange={e => setTyped(e.target.value)} />
-            <div className="small muted">{typed ? (typedCents === null ? "Enter a dollar amount" : differs ? `Differs from the computed ${money(computed)}; a note is required` : "Same as computed") : `Computed from the agreement${check.pendingDecisions.length ? " and your decisions above" : ""}`}</div>
+            <div className="small muted">{typed ? (typedCents === null ? "Enter a dollar amount above $0" : differs ? `Differs from the computed ${money(computed)}; a note is required` : "Same as computed") : `Computed from the agreement${check.pendingDecisions.length ? " and your decisions above" : ""}`}</div>
           </div>
           <div className="grow"><label>Pay by</label><input value={method} onChange={e => setMethod(e.target.value)} placeholder="Venmo, Zelle, cash…" /></div>
         </div>

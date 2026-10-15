@@ -25,7 +25,7 @@ func arr(items map[string]any, desc string) map[string]any {
 
 var ruleSchema = obj(map[string]any{
 	"id": str("short stable id, e.g. r1"), "kind": str("hourly|multiplier|adder|flat|per_unit|minimum|fee|reimbursement|per_period|rounding"),
-	"service": str("stable key bills map to: hourly, date_night, regular_visit, deep_clean, walk_30 ..."), "label": str("the helper's own words"),
+	"service": str("stable key bills map to: hourly, date_night, regular_visit, deep_clean, half_hour_walk ..."), "label": str("the helper's own words"),
 	"rateCents": num(""), "amountCents": num(""), "factor": num(""), "perHourCents": num(""), "unit": str(""), "from": str("HH:MM"), "until": str("HH:MM"),
 	"when":  obj(map[string]any{"days": arr(str("mon..sun"), ""), "from": str("HH:MM"), "to": str("HH:MM"), "dates": str("us_federal_holidays"), "exactDates": arr(str("YYYY-MM-DD"), "")}),
 	"hours": num(""), "per": str("booking|extra_child|..."), "percentOfBooking": num(""),

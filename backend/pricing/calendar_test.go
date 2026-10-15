@@ -42,3 +42,27 @@ func TestUSFederalHolidays(t *testing.T) {
 		}
 	}
 }
+
+func TestNewYearObservedOnPreviousDec31(t *testing.T) {
+	// Jan 1 2028 is a Saturday: observed Friday 2027-12-31, which belongs to 2027's list
+	if h := USFederalHolidays(2027); h["2027-12-31"] != "New Year's Day (observed)" {
+		t.Errorf("2027-12-31: %q", h["2027-12-31"])
+	}
+	c, _ := Calendar("2027-12", []Day{"fri"}, NY())
+	// Fridays 3, 10, 17, 24, 31; the 24th (Christmas observed) and the 31st are holidays
+	if c.Holidays["2027-12-31"] == "" || c.UsualDays != 3 {
+		t.Errorf("Dec 2027: holidays %v usual %d", c.Holidays, c.UsualDays)
+	}
+}
+
+func TestUsualDaysAnyCase(t *testing.T) {
+	a, _ := Calendar("2026-09", []Day{"tue"}, NY())
+	b, _ := Calendar("2026-09", []Day{"Tue"}, NY())
+	c, _ := Calendar("2026-09", []Day{"Tuesday"}, NY())
+	if a.UsualDays != 5 || b.UsualDays != 5 || c.UsualDays != 5 {
+		t.Errorf("usual days: %d %d %d", a.UsualDays, b.UsualDays, c.UsualDays)
+	}
+	if !containsDay([]Day{"Tue"}, "tue") {
+		t.Errorf("containsDay should ignore case")
+	}
+}

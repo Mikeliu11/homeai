@@ -46,10 +46,14 @@ function ProposalCardInner({ proposal, onDone }: { proposal: Proposal; onDone: (
   const who = (p: { helperId?: string; newHelper?: { name?: string; role?: string; payMethod?: string } }) =>
     p.newHelper ? `${p.newHelper.name} (new helper, ${p.newHelper.role}${p.newHelper.payMethod ? `, paid by ${p.newHelper.payMethod}` : ""})` : helpers[p.helperId ?? ""]?.name ?? "…";
 
+  // After a successful confirm or reject the buttons stay disabled until the
+  // parent refetches the card and it renders as closed; only a failure re-enables them.
   async function confirm() {
     setBusy(true); setError("");
+    let ok = false;
     try {
       const res = await api.confirm(proposal.id, proposal.contentHash, editing ? draft : undefined);
+      ok = true;
       invalidateHelpers();
       setEditing(false);
       if (res.kind === "terms" && res.termsVersion?.helperId) setConfirmedHelperId(res.termsVersion.helperId);
@@ -57,11 +61,12 @@ function ProposalCardInner({ proposal, onDone }: { proposal: Proposal; onDone: (
     } catch (e) {
       const ae = e as ApiError;
       setError(ae.code === "hash_mismatch" ? "This card changed since you opened it. Reload the page and try again." : ae.message);
-    } finally { setBusy(false); }
+    } finally { if (!ok) setBusy(false); }
   }
   async function reject() {
     setBusy(true); setError("");
-    try { await api.reject(proposal.id); onDone({ kind: "rejected" }); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    let ok = false;
+    try { await api.reject(proposal.id); ok = true; onDone({ kind: "rejected" }); } catch (e) { setError((e as Error).message); } finally { if (!ok) setBusy(false); }
   }
 
   const header = (

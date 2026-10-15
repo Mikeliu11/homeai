@@ -6,6 +6,7 @@ package records
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"helperpay/pricing"
 )
@@ -20,7 +21,17 @@ var (
 	ErrAmountRequired    = errors.New("a typed amount and a note are required when a line could not be priced")
 	ErrNoteRequired      = errors.New("say why the amount differs from what the agreement supports")
 	ErrInvalid           = errors.New("invalid proposal")
+	ErrRefused           = errors.New("refused") // a user-fixable refusal; the message says why
 )
+
+// refusal is an error the user can act on. Its text is shown as-is and it
+// matches ErrRefused for the HTTP status.
+type refusal struct{ msg string }
+
+func (r refusal) Error() string        { return r.msg }
+func (r refusal) Is(target error) bool { return target == ErrRefused }
+
+func refuse(format string, a ...any) error { return refusal{fmt.Sprintf(format, a...)} }
 
 type Helper struct {
 	ID        string        `json:"id"`

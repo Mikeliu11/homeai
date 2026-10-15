@@ -53,3 +53,17 @@ func TestMulHours(t *testing.T) {
 		t.Errorf("got %d", got)
 	}
 }
+
+func TestMultipliedRateRoundedOnce(t *testing.T) {
+	// $22.01 × 1.15 × 8h = $202.492 → $202.49 (rounding the rate first gives $25.31 × 8 = $202.48)
+	if got := PerHour(2201).TimesForMinutes(1.15, 480); got != 20249 {
+		t.Errorf("one-step: %d", got)
+	}
+	terms := Terms{EffectiveFrom: "2026-01-01", Rules: []Rule{
+		{ID: "h", Kind: KindHourly, Service: "hourly", RateCents: 2201},
+		{ID: "s", Kind: KindMultiplier, Label: "Saturdays +15%", Factor: 1.15, When: &Window{Days: []Day{"sat"}}}}}
+	r := PriceLine(Line{Date: "2026-09-12", Service: "hourly", Start: "09:00", End: "17:00", ClaimedCents: 20249}, terms, NY())
+	if r.Status != StatusMatch || r.ExpectedCents != 20249 {
+		t.Errorf("saturday 8h: %s %d (%s)", r.Status, r.ExpectedCents, r.Explanation)
+	}
+}

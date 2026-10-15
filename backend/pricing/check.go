@@ -74,7 +74,7 @@ func CheckBill(b Bill, versions []Terms, cal CalendarFacts, otherBillDates map[s
 	res := CheckResult{ClaimedTotalCents: b.ClaimedTotalCents, EngineVersion: EngineVersion,
 		Lines: []LineResult{}, PendingDecisions: []Decision{}, Flags: []Flag{}, TermsUsed: []string{}}
 	used := map[string]bool{}
-	seen := map[string]int{}
+	seen := map[string]int{} // duplicate key → index of the first line with it
 	var unitsBilled float64
 	serviceDates := map[string]bool{} // distinct dates with a priced service line (fees don't count as days)
 	hourlyHelper := false
@@ -98,14 +98,18 @@ func CheckBill(b Bill, versions []Terms, cal CalendarFacts, otherBillDates map[s
 		}
 		res.Lines = append(res.Lines, lr)
 
-		switch lr.Status {
-		case StatusMatch, StatusOver:
-			res.AgreedTotalCents += lr.ExpectedCents
-		case StatusUnder:
-			res.AgreedTotalCents += l.ClaimedCents // never pay more than asked without a decision
-		default:
-			res.PendingDecisions = append(res.PendingDecisions, Decision{LineIndex: i, Status: lr.Status, Readings: lr.Readings,
-				Claim: firstNonEmpty(l.Note, l.Service), Why: lr.Explanation})
+		// bill-level flags first: a repeated, out-of-period or already-billed line
+		// stays out of the agreed total until Jordan decides on it
+		var hold []string
+		heldProblems := 0
+		flag := func(f Flag, holds bool) {
+			res.Flags = append(res.Flags, f)
+			if holds {
+				hold = append(hold, f.Message)
+				if f.Level == "problem" {
+					heldProblems++
+				}
+			}
 		}
 		if l.Date != "" {
 			if l.Start != "" || l.Qty > 0 || (lr.Status != StatusUnagreed && lr.Status != StatusUnpriceable) {
@@ -114,27 +118,64 @@ func CheckBill(b Bill, versions []Terms, cal CalendarFacts, otherBillDates map[s
 			if l.Start != "" {
 				hourlyHelper = true
 			}
-			key := l.Date + "|" + l.Service + "|" + l.Start + "|" + l.End + "|" + fmt.Sprint(l.ClaimedCents)
-			seen[key]++
-			if seen[key] == 2 {
-				res.Flags = append(res.Flags, Flag{Code: "duplicate_line", Level: "problem", Message: fmt.Sprintf("Line %d repeats an earlier line (%s %s).", i+1, l.Date, firstNonEmpty(l.Note, l.Service))})
+			key := strings.Join([]string{l.Date, l.Service, l.Start, l.End, trimFloat(l.Qty), strings.TrimSpace(l.Note), fmt.Sprint(l.ClaimedCents)}, "|")
+			if first, ok := seen[key]; ok {
+				if l.Start == "" && l.Qty == 0 {
+					// a date and an amount only: two walks on one day look the same, so ask rather than call it a repeat
+					flag(Flag{Code: "duplicate_line", Level: "info", Message: fmt.Sprintf("Line %d has the same date, service and amount as line %d and no times; check it is a second visit, not a repeat.", i+1, first+1)}, true)
+				} else {
+					flag(Flag{Code: "duplicate_line", Level: "problem", Message: fmt.Sprintf("Line %d repeats line %d (%s %s).", i+1, first+1, l.Date, firstNonEmpty(l.Note, l.Service))}, true)
+				}
+			} else {
+				seen[key] = i
 			}
 			if cal.Start != "" && (l.Date < cal.Start || l.Date > cal.End) {
-				res.Flags = append(res.Flags, Flag{Code: "outside_period", Level: "problem", Message: fmt.Sprintf("Line %d is dated %s, outside %s.", i+1, l.Date, b.Period)})
+				flag(Flag{Code: "outside_period", Level: "problem", Message: fmt.Sprintf("Line %d is dated %s, outside %s.", i+1, l.Date, b.Period)}, true)
 			}
 			if name, ok := cal.Holidays[l.Date]; ok {
-				res.Flags = append(res.Flags, Flag{Code: "holiday", Level: "info", Message: fmt.Sprintf("Line %d falls on %s (%s).", i+1, name, l.Date)})
+				flag(Flag{Code: "holiday", Level: "info", Message: fmt.Sprintf("Line %d falls on %s (%s).", i+1, name, l.Date)}, false)
 			}
-			if len(cal.UsualDayNames) > 0 && l.Start == "" { // per-visit helpers only; sitters work odd evenings by design
+			if len(cal.UsualDayNames) > 0 && l.Start == "" && visitService(versions, l.Service) { // visits only: sitters work odd evenings by design, and a fee is not a visit
 				if d, err := ParseDate(l.Date, loc); err == nil && !containsDay(cal.UsualDayNames, dayOf[d.Weekday()]) {
-					res.Flags = append(res.Flags, Flag{Code: "non_usual_day", Level: "info", Message: fmt.Sprintf("Line %d is on a %s, not one of the usual days.", i+1, d.Weekday())})
+					flag(Flag{Code: "non_usual_day", Level: "info", Message: fmt.Sprintf("Line %d is on a %s, not one of the usual days.", i+1, d.Weekday())}, false)
 				}
 			}
 			if otherBillDates[l.Date] {
-				res.Flags = append(res.Flags, Flag{Code: "duplicate_date_other_bill", Level: "problem", Message: fmt.Sprintf("%s already appears on another bill for this helper.", l.Date)})
+				flag(Flag{Code: "duplicate_date_other_bill", Level: "problem", Message: fmt.Sprintf("Line %d: %s already appears on another bill for this helper.", i+1, l.Date)}, true)
 			}
-		} else if l.Qty > 0 {
-			unitsBilled += l.Qty
+		}
+
+		switch {
+		case len(hold) > 0 && (lr.Status == StatusMatch || lr.Status == StatusOver || lr.Status == StatusUnder):
+			// priced, but flagged: needs your call, kept out of the agreed total
+			d := Decision{LineIndex: i, Status: lr.Status, Claim: firstNonEmpty(l.Note, l.Service), Why: strings.Join(hold, " ") + " " + lr.Explanation}
+			if lr.Status == StatusOver && len(lr.Readings) > 0 {
+				d.Status, d.Readings = StatusAmbiguous, lr.Readings[:1] // offer the agreed amount as a choice
+			}
+			res.PendingDecisions = append(res.PendingDecisions, d)
+			res.Problems -= heldProblems // the decision is the problem; do not count its flag twice
+		case lr.Status == StatusMatch || lr.Status == StatusOver:
+			res.AgreedTotalCents += lr.ExpectedCents
+			if lr.Status == StatusOver {
+				res.Problems++
+			}
+		case lr.Status == StatusUnder:
+			res.AgreedTotalCents += l.ClaimedCents // never pay more than asked without a decision
+		default:
+			why := lr.Explanation
+			if len(hold) > 0 {
+				why = strings.Join(hold, " ") + " " + why
+				res.Problems -= heldProblems
+			}
+			res.PendingDecisions = append(res.PendingDecisions, Decision{LineIndex: i, Status: lr.Status, Readings: lr.Readings,
+				Claim: firstNonEmpty(l.Note, l.Service), Why: why})
+		}
+		if l.Date == "" && l.Qty > 0 {
+			if hourlyService(versions, l.Service) {
+				hourlyHelper = true // hours, not visits: they say nothing about the usual days
+			} else {
+				unitsBilled += l.Qty
+			}
 		}
 	}
 
@@ -161,12 +202,8 @@ func CheckBill(b Bill, versions []Terms, cal CalendarFacts, otherBillDates map[s
 	}
 	sort.Strings(res.TermsUsed)
 
-	// problems = lines not matching + pending decisions + problem-level flags
-	for _, lr := range res.Lines {
-		if lr.Status == StatusOver {
-			res.Problems++
-		}
-	}
+	// problems = over lines + pending decisions + problem-level flags (over lines
+	// were counted in the loop; a flag that became a decision was taken back out)
 	res.Problems += len(res.PendingDecisions)
 	for _, f := range res.Flags {
 		if f.Level == "problem" {
@@ -203,12 +240,22 @@ func priceUndated(l Line, versions []Terms, cal CalendarFacts, loc *time.Locatio
 	if cal.Start == "" {
 		return LineResult{Line: l, Status: StatusUnpriceable, Explanation: "Undated line and no billing period."}
 	}
-	var inPeriod []Terms
+	// snapshots that start inside the period; of two with the same start, the
+	// later confirmation (a correction) replaces the earlier, as in TermsInForce
+	latest := map[string]Terms{}
 	for _, v := range versions {
-		if v.EffectiveFrom > cal.Start && v.EffectiveFrom <= cal.End {
-			inPeriod = append(inPeriod, v)
+		if v.EffectiveFrom <= cal.Start || v.EffectiveFrom > cal.End || (v.EffectiveTo != "" && v.EffectiveTo < v.EffectiveFrom) {
+			continue
+		}
+		if cur, ok := latest[v.EffectiveFrom]; !ok || v.ConfirmedAt > cur.ConfirmedAt {
+			latest[v.EffectiveFrom] = v
 		}
 	}
+	var inPeriod []Terms
+	for _, v := range latest {
+		inPeriod = append(inPeriod, v)
+	}
+	sort.Slice(inPeriod, func(i, j int) bool { return inPeriod[i].EffectiveFrom < inPeriod[j].EffectiveFrom })
 	first, ok := TermsInForce(versions, cal.Start)
 	if !ok && len(inPeriod) == 0 {
 		return LineResult{Line: l, Status: StatusUnpriceable, Explanation: fmt.Sprintf("No confirmed terms were in force in %s.", cal.Period)}
@@ -223,14 +270,27 @@ func priceUndated(l Line, versions []Terms, cal CalendarFacts, loc *time.Locatio
 	if len(results) == 1 {
 		return results[0]
 	}
+	// every snapshot prices the line the same way: no question to ask
+	same := true
+	for _, r := range results[1:] {
+		same = same && r.Status == results[0].Status && centsOf(r.Readings) == centsOf(results[0].Readings)
+	}
+	if same {
+		return results[0]
+	}
 	// several snapshots apply inside the period and the line carries no date
 	out := LineResult{Line: l, Status: StatusAmbiguous, TermsLabel: "several"}
 	var parts []string
+	seenCents := map[Cents]bool{}
 	for _, r := range results {
 		if len(r.Readings) == 0 {
 			continue
 		}
 		rd := r.Readings[0]
+		if seenCents[rd.ExpectedCents] {
+			continue
+		}
+		seenCents[rd.ExpectedCents] = true
 		rd.Explanation = fmt.Sprintf("%s under %s", rd.Explanation, r.TermsLabel)
 		out.Readings = append(out.Readings, rd)
 		parts = append(parts, fmt.Sprintf("%s (%s)", rd.ExpectedCents, r.TermsLabel))
@@ -238,9 +298,57 @@ func priceUndated(l Line, versions []Terms, cal CalendarFacts, loc *time.Locatio
 	if len(out.Readings) == 0 {
 		return results[0]
 	}
+	priced := 0
+	for _, r := range results {
+		if len(r.Readings) > 0 {
+			priced++
+		}
+	}
+	if len(out.Readings) == 1 && priced == len(results) {
+		// the snapshots differ, but not on this line's price: finish on the one reading
+		return finish(LineResult{Line: l, TermsLabel: results[0].TermsLabel, Info: results[0].Info}, out.Readings[:1], nil, "", "")
+	}
 	out.ExpectedCents = out.Readings[0].ExpectedCents
 	out.Explanation = fmt.Sprintf("The rate changed during %s and this line has no dates, so it could be %s. Billed %s.", cal.Period, strings.Join(parts, " or "), l.ClaimedCents)
 	return out
+}
+
+// visitService says whether a line counts as a visit: no service (the default
+// per-visit rate) or a per-unit service in some snapshot. Fees and unagreed
+// extras are not visits.
+func visitService(versions []Terms, svc string) bool {
+	if svc == "" {
+		return true
+	}
+	for _, t := range versions {
+		for _, r := range t.Rules {
+			if r.Service == svc && r.Kind == KindPerUnit {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hourlyService says whether a service is priced by the hour in any snapshot.
+func hourlyService(versions []Terms, svc string) bool {
+	for _, v := range versions {
+		for _, r := range v.Rules {
+			if r.Kind == KindHourly && r.Service == svc {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// centsOf is a reading set's amounts, for comparing two pricings of one line.
+func centsOf(rs []Reading) string {
+	var b strings.Builder
+	for _, r := range rs {
+		fmt.Fprintf(&b, "%d,", r.ExpectedCents)
+	}
+	return b.String()
 }
 
 func holidayNote(cal CalendarFacts) string {
@@ -259,7 +367,7 @@ func holidayNote(cal CalendarFacts) string {
 
 func containsDay(ds []Day, d Day) bool {
 	for _, x := range ds {
-		if x == d {
+		if normDay(x) == normDay(d) {
 			return true
 		}
 	}

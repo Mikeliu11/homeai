@@ -157,3 +157,63 @@ func TestScriptedStarterPack(t *testing.T) {
 		t.Errorf("want assumptions on the card")
 	}
 }
+
+func TestFailedTurnDoesNotBreakTheConversation(t *testing.T) {
+	ctx := context.Background()
+	llm := &stubLLM{err: errors.New("ThrottlingException: slow down")}
+	r, st := newRunner(llm)
+	queue(st, "turn1", "here is lupe's thread: $140 each visit")
+	if err := r.RunTurn(ctx, "turn1"); err == nil {
+		t.Fatal("first turn should fail")
+	}
+	// the next turn in the same session must send alternating roles
+	llm.err = nil
+	llm.resps = []ConverseResponse{{StopReason: "end_turn", Message: Message{Role: "assistant", Content: []ContentBlock{{Text: "Got it."}}}}}
+	_ = st.PutTurn(ctx, records.Turn{ID: "turn2", SessionID: "s1", UserText: "sorry, again: $140 each visit", Status: records.TurnQueued, CreatedAt: "2026-10-09T12:01:00Z", UpdatedAt: "2026-10-09T12:01:00Z"})
+	if err := r.RunTurn(ctx, "turn2"); err != nil {
+		t.Fatal(err)
+	}
+	msgs := llm.calls[len(llm.calls)-1].Messages
+	if len(msgs) == 0 || msgs[0].Role != "user" {
+		t.Fatalf("history must start with a user message: %+v", msgs)
+	}
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].Role == msgs[i-1].Role {
+			t.Fatalf("roles must alternate; message %d and %d are both %s", i-1, i, msgs[i].Role)
+		}
+	}
+	if msgs[len(msgs)-1].Role != "user" || !strings.Contains(msgs[len(msgs)-1].Content[len(msgs[len(msgs)-1].Content)-1].Text, "again") {
+		t.Fatalf("the new message must be the last user block: %+v", msgs[len(msgs)-1])
+	}
+}
+
+func TestTruncatedToolCallIsNotRun(t *testing.T) {
+	ctx := context.Background()
+	propose := map[string]any{"newHelper": map[string]any{"name": "Lupe", "role": "cleaner"}, "effectiveFrom": "2026-01-14",
+		"rules": []any{map[string]any{"kind": "per_unit", "service": "regular_visit", "unit": "visit", "amountCents": 14000}}, "sourceIds": []any{}, "summary": "Lupe $140"}
+	llm := &stubLLM{resps: []ConverseResponse{{StopReason: "max_tokens", Message: Message{Role: "assistant", Content: []ContentBlock{
+		{ToolUse: &ToolUse{ID: "t1", Name: "propose_terms", Input: propose}}}}}}}
+	r, st := newRunner(llm)
+	queue(st, "turn1", "lupe")
+	_ = r.RunTurn(ctx, "turn1")
+	if ps, _ := st.ListProposals(ctx, "open"); len(ps) != 0 {
+		t.Fatalf("a cut-off tool call must not create a card, got %d", len(ps))
+	}
+}
+
+func TestEmptyToolResultIsNeverSent(t *testing.T) {
+	ctx := context.Background()
+	llm := &stubLLM{resps: []ConverseResponse{
+		{StopReason: "tool_use", Message: Message{Role: "assistant", Content: []ContentBlock{{ToolUse: &ToolUse{ID: "t1", Name: "get_helpers", Input: map[string]any{}}}}}},
+		{StopReason: "end_turn", Message: Message{Role: "assistant", Content: []ContentBlock{{Text: "No helpers yet."}}}},
+	}}
+	r, st := newRunner(llm)
+	queue(st, "turn1", "who do we have?")
+	if err := r.RunTurn(ctx, "turn1"); err != nil {
+		t.Fatal(err)
+	}
+	last := llm.calls[1].Messages[len(llm.calls[1].Messages)-1]
+	if last.Content[0].ToolResult == nil || strings.TrimSpace(last.Content[0].ToolResult.Text) == "" {
+		t.Fatalf("empty tool result sent: %+v", last)
+	}
+}

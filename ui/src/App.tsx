@@ -29,8 +29,8 @@ export default function App({ authEnabled }: { authEnabled: boolean }) {
           <div className="spacer" />
           {authEnabled ? <button className="link" onClick={() => signOut()}>Sign out</button> : <span className="badge">local</span>}
         </header>
-        <ErrorBoundary>
-        <div className="page" key={location.pathname}>
+        <ErrorBoundary key={location.pathname}>
+        <div className="page">
         <Routes>
           <Route path="/" element={<Navigate to="/home" replace />} />
           <Route path="/inbox" element={<Navigate to="/home" replace />} />

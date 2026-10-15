@@ -201,6 +201,6 @@ export class HelperPayStack extends cdk.Stack {
     new cdk.CfnOutput(this, "Region", { value: region });
     new cdk.CfnOutput(this, "ApiUrl", { value: apiUrl });
     new cdk.CfnOutput(this, "MemoryId", { value: memory.memoryId });
-    new cdk.CfnOutput(this, "SmokeCommand", { value: `TABLE_RECORDS=${records.tableName} TABLE_PROPOSALS=${proposals.tableName} AWS_REGION=${region} go run ./cmd/smoke   # from app/backend` });
+    new cdk.CfnOutput(this, "SmokeCommand", { value: `TABLE_RECORDS=${records.tableName} TABLE_PROPOSALS=${proposals.tableName} AWS_REGION=${region} go run ./cmd/smoke   # from backend/` });
   }
 }

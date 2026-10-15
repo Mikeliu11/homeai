@@ -1,6 +1,9 @@
 package pricing
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestWindowSplit(t *testing.T) {
 	loc := NY()
@@ -56,4 +59,37 @@ func sum(ss []Span) int {
 		n += s.Minutes()
 	}
 	return n
+}
+
+func TestDayWindowCrossingMidnightKeepsItsDay(t *testing.T) {
+	loc := NY()
+	fri := Window{Days: []Day{"fri"}, From: "22:00", To: "02:00"}
+	// Fri 2026-09-25 21:00 → Sat 02:00: 22:00–02:00 is inside, the after-midnight part belongs to Friday
+	s, _ := SpanOnDate("2026-09-25", "21:00", "02:00", loc)
+	in, out := SplitSpanByWindow(s, fri)
+	if sum(in) != 240 || sum(out) != 60 {
+		t.Errorf("friday late: in=%d out=%d", sum(in), sum(out))
+	}
+	sat1am := time.Date(2026, 9, 26, 1, 0, 0, 0, loc)
+	if !fri.Matches(sat1am) {
+		t.Errorf("Sat 01:00 should be in Friday's 22:00–02:00")
+	}
+	// Saturday night's after-midnight hours (Sun 01:00) are not Friday's
+	if fri.Matches(time.Date(2026, 9, 27, 1, 0, 0, 0, loc)) {
+		t.Errorf("Sun 01:00 is not in a Friday window")
+	}
+	// Thursday night into Friday: Fri 01:00 belongs to Thursday, so it is out
+	s, _ = SpanOnDate("2026-09-24", "23:00", "02:00", loc)
+	if in, _ = SplitSpanByWindow(s, fri); sum(in) != 0 {
+		t.Errorf("thursday night: in=%d", sum(in))
+	}
+
+	// priced: Fri 21:00–02:00 with $30/hr Fridays 22:00–02:00 over $20 base = $20 + 4 × $30 = $140
+	terms := Terms{EffectiveFrom: "2026-01-01", Rules: []Rule{
+		{ID: "b", Kind: KindHourly, Service: "hourly", RateCents: 2000},
+		{ID: "f", Kind: KindHourly, Service: "hourly", Label: "Friday late", RateCents: 3000, When: &fri}}}
+	r := PriceLine(line("2026-09-25", "hourly", "21:00", "02:00", 14000), terms, loc)
+	if r.Status != StatusMatch || r.ExpectedCents != 14000 {
+		t.Errorf("friday late priced: %s %d (%s)", r.Status, r.ExpectedCents, r.Explanation)
+	}
 }

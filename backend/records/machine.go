@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -69,7 +70,7 @@ func (m *Machine) ProposeBill(ctx context.Context, key, by string, bp BillPropos
 				continue
 			}
 			if b.Status == BillApproved {
-				return Proposal{}, fmt.Errorf("%s's %s bill is already approved and locked (%s); a second bill for that month cannot be added", h.Name, b.Period, b.Approval.AmountCents)
+				return Proposal{}, fmt.Errorf("%s's %s bill is already approved and locked at %s; a second bill for that month cannot be added: %w", h.Name, b.Period, b.Approval.AmountCents, ErrAlreadyApproved)
 			}
 			bp.Assumptions = append(bp.Assumptions, fmt.Sprintf("This replaces the open %s bill already on record for %s (%s billed). Confirming it discards those lines.", b.Period, h.Name, b.Bill.ClaimedTotalCents))
 		}
@@ -92,6 +93,9 @@ func (m *Machine) supersede(ctx context.Context, p Proposal, same func(Proposal)
 	for _, o := range open {
 		if o.ID == p.ID || o.CreatedAt > p.CreatedAt || !same(o) {
 			continue
+		}
+		if o.ProposedBy == "user" && p.ProposedBy != "user" {
+			continue // the model never replaces a card Jordan edited
 		}
 		if _, err := m.Store.CloseProposal(ctx, o.ID, "superseded", p.ID, m.now()); err == nil {
 			_ = m.Store.AppendAudit(ctx, AuditEvent{TS: m.now(), Actor: "system", Action: "proposal.superseded", Entity: "proposal", EntityID: o.ID, Detail: "replaced by " + p.ID})
@@ -131,6 +135,12 @@ func (m *Machine) EditTermsProposal(ctx context.Context, id string, tp TermsProp
 	if errs := pricing.ValidateTerms(tp.Terms); len(errs) > 0 {
 		return Proposal{}, fmt.Errorf("%w: %s", ErrInvalid, strings.Join(errs, "; "))
 	}
+	// everything ProposeTerms could refuse is checked before the original is closed
+	if tp.HelperID != "" {
+		if _, err := m.Store.GetHelper(ctx, tp.HelperID); err != nil {
+			return Proposal{}, refuse("helper %s is not on record any more", tp.HelperID)
+		}
+	}
 	key := "user:" + NewID()
 	if _, err := m.Store.CloseProposal(ctx, id, "edited", key, m.now()); err != nil {
 		return Proposal{}, err
@@ -154,6 +164,19 @@ func (m *Machine) EditBillProposal(ctx context.Context, id string, bp BillPropos
 	}
 	if errs := pricing.ValidateBill(bp.Bill); len(errs) > 0 {
 		return Proposal{}, fmt.Errorf("%w: %s", ErrInvalid, strings.Join(errs, "; "))
+	}
+	// everything ProposeBill could refuse is checked before the original is closed
+	if bp.HelperID != "" {
+		h, err := m.Store.GetHelper(ctx, bp.HelperID)
+		if err != nil {
+			return Proposal{}, refuse("helper %s is not on record any more", bp.HelperID)
+		}
+		bills, _ := m.Store.ListBills(ctx, h.ID)
+		for _, b := range bills {
+			if b.Period == bp.Bill.Period && b.Status == BillApproved {
+				return Proposal{}, fmt.Errorf("%s %s: %w", h.Name, b.Period, ErrAlreadyApproved)
+			}
+		}
 	}
 	key := "user:" + NewID()
 	if _, err := m.Store.CloseProposal(ctx, id, "edited", key, m.now()); err != nil {
@@ -180,17 +203,27 @@ func refreshTermsText(old, edited TermsProposal) TermsProposal {
 			continue
 		}
 		pairs := [][2]pricing.Cents{{o.RateCents, r.RateCents}, {o.AmountCents, r.AmountCents}, {o.PerHourCents, r.PerHourCents}}
+		label := r.Label
 		for _, pr := range pairs {
 			if pr[0] != pr[1] && pr[0] != 0 {
-				edited.Terms.Rules[i].Label = strings.ReplaceAll(r.Label, pr[0].String(), pr[1].String())
-				edited.Summary = strings.ReplaceAll(edited.Summary, pr[0].String(), pr[1].String())
+				label = replaceMoney(label, pr[0], pr[1])
+				edited.Summary = replaceMoney(edited.Summary, pr[0], pr[1])
 			}
 		}
+		edited.Terms.Rules[i].Label = label
 	}
 	if edited.Summary != "" && !strings.Contains(edited.Summary, "(edited") {
 		edited.Summary += " (edited by Jordan)"
 	}
 	return edited
+}
+
+// replaceMoney swaps one amount for another in prose, whole amounts only:
+// $30 -> $32 must not turn "$300 cap" into "$320 cap".
+func replaceMoney(s string, from, to pricing.Cents) string {
+	old := from.String()
+	re := regexp.MustCompile(regexp.QuoteMeta(old) + `([^\d.,]|$)`)
+	return re.ReplaceAllStringFunc(s, func(match string) string { return to.String() + match[len(old):] })
 }
 
 // Reject closes a proposal without effect.
@@ -212,7 +245,7 @@ func (m *Machine) openProposal(ctx context.Context, id, hash, kind string) (Prop
 		return p, ErrProposalClosed
 	}
 	if p.Kind != kind {
-		return p, fmt.Errorf("proposal %s is a %s proposal", id, p.Kind)
+		return p, refuse("proposal %s is a %s proposal, not %s", id, p.Kind, kind)
 	}
 	if p.ContentHash != hash || ContentHash(json.RawMessage(p.Payload)) != hash {
 		return p, ErrHashMismatch
@@ -268,6 +301,12 @@ func (m *Machine) ConfirmTerms(ctx context.Context, proposalID, hash, by string)
 	if err := json.Unmarshal(p.Payload, &tp); err != nil {
 		return TermsVersion{}, err
 	}
+	// Claim the proposal first (conditional on it still being open) so a
+	// second click, tab or retry cannot create a second version or helper.
+	versionID := NewID()
+	if _, err := m.Store.CloseProposal(ctx, p.ID, "confirmed", versionID, m.now()); err != nil {
+		return TermsVersion{}, err
+	}
 	h, err := m.ensureHelper(ctx, tp.HelperID, tp.NewHelper, by)
 	if err != nil {
 		return TermsVersion{}, err
@@ -282,13 +321,10 @@ func (m *Machine) ConfirmTerms(ctx context.Context, proposalID, hash, by string)
 			t.Label = h.Name + ", terms since " + t.EffectiveFrom
 		}
 	}
-	v := TermsVersion{ID: NewID(), HelperID: h.ID, Terms: t, SourceIDs: tp.SourceIDs, Summary: tp.Summary, Assumptions: tp.Assumptions,
+	v := TermsVersion{ID: versionID, HelperID: h.ID, Terms: t, SourceIDs: tp.SourceIDs, Summary: tp.Summary, Assumptions: tp.Assumptions,
 		ProposalID: p.ID, ConfirmedAt: m.now(), ConfirmedBy: by}
 	v.ContentHash = ContentHash(v.Terms)
 	if err := m.Store.PutTermsVersion(ctx, v); err != nil {
-		return v, err
-	}
-	if _, err := m.Store.CloseProposal(ctx, p.ID, "confirmed", v.ID, m.now()); err != nil {
 		return v, err
 	}
 	_ = m.Store.AppendAudit(ctx, AuditEvent{TS: m.now(), Actor: by, Action: "terms.confirmed", Entity: "terms", EntityID: v.ID, Hash: v.ContentHash, Detail: v.Terms.Label})
@@ -333,13 +369,14 @@ func (m *Machine) ConfirmBill(ctx context.Context, proposalID, hash, by string) 
 	}
 	rec.Bill, rec.SourceIDs, rec.Assumptions, rec.ProposalID = bp.Bill, bp.SourceIDs, bp.Assumptions, p.ID
 	rec.Approval, rec.HoldNote = nil, ""
+	// claim the proposal before writing, so a double confirm cannot write twice
+	if _, err := m.Store.CloseProposal(ctx, p.ID, "confirmed", rec.ID, m.now()); err != nil {
+		return rec, err
+	}
 	if err := m.check(ctx, &rec, h); err != nil {
 		return rec, err
 	}
 	if err := m.Store.PutBill(ctx, rec); err != nil {
-		return rec, err
-	}
-	if _, err := m.Store.CloseProposal(ctx, p.ID, "confirmed", rec.ID, m.now()); err != nil {
 		return rec, err
 	}
 	_ = m.Store.AppendAudit(ctx, AuditEvent{TS: m.now(), Actor: by, Action: "bill.confirmed", Entity: "bill", EntityID: rec.ID, Hash: rec.CheckHash, Detail: h.Name + " " + rec.Period})
@@ -429,7 +466,10 @@ func (m *Machine) Approve(ctx context.Context, billID, hash string, a Approval) 
 		return rec, ErrTermsChanged
 	}
 	if rec.Check == nil {
-		return rec, fmt.Errorf("no confirmed terms for %s yet", h.Name)
+		return rec, refuse("no confirmed terms for %s yet; confirm the agreement first", h.Name)
+	}
+	if a.AmountCents < 0 {
+		return rec, refuse("the amount cannot be negative")
 	}
 	// every pending decision must be included or excluded
 	inc := map[int]bool{}
@@ -453,7 +493,7 @@ func (m *Machine) Approve(ctx context.Context, billID, hash string, a Approval) 
 				}
 			}
 			if !ok {
-				return rec, fmt.Errorf("%s is not one of the readings for line %d", chosen, d.LineIndex+1)
+				return rec, refuse("%s is not one of the readings offered for line %d", chosen, d.LineIndex+1)
 			}
 			amount += chosen
 		case inc[d.LineIndex]:

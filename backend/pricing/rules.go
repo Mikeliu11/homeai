@@ -73,7 +73,7 @@ type Line struct {
 	Flags        map[string]bool    `json:"flags,omitempty"`        // same_day, cancelled, receipt
 	Extras       map[string]float64 `json:"extras,omitempty"`       // extra_child: 1
 	BookingCents Cents              `json:"bookingCents,omitempty"` // base for percent fees
-	NoticeHours  float64            `json:"noticeHours,omitempty"`  // for cancellations: how much notice was given
+	NoticeHours  *float64           `json:"noticeHours,omitempty"`  // for cancellations: how much notice was given; nil = not stated
 }
 
 // Status is the verdict on a line.

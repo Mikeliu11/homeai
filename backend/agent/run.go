@@ -53,6 +53,9 @@ func (r *Runner) RunTurn(ctx context.Context, turnID string) (err error) {
 		if err != nil {
 			t.Status, t.Error, t.Progress, t.UpdatedAt = records.TurnFailed, friendly(err), "failed", now()
 			_ = r.Store.UpdateTurn(context.WithoutCancel(ctx), t)
+			// Keep the memory transcript alternating: an unanswered user event
+			// would make every later Converse call in this session invalid.
+			_ = r.Memory.AddEvent(context.WithoutCancel(ctx), t.SessionID, t.ID+":assistant", "assistant", "(I could not process that message: "+t.Error+")")
 		}
 	}()
 	progress := func(p string) {
@@ -121,8 +124,9 @@ func (r *Runner) RunTurn(ctx context.Context, turnID string) (err error) {
 		}
 		msgs = append(msgs, Message{Role: e.Role, Content: []ContentBlock{{Text: e.Text}}})
 	}
-	msgs = normalizeRoles(msgs)
-	msgs = append(msgs, Message{Role: "user", Content: blocks})
+	// Normalise after appending: a failed earlier turn can leave an unanswered
+	// user event in the history, and Converse rejects two user turns in a row.
+	msgs = normalizeRoles(append(msgs, Message{Role: "user", Content: blocks}))
 	today := r.Now().In(r.Loc).Format("Monday, January 2, 2006")
 	system := SystemPrompt(today, r.helpersSummary(ctx), memories)
 
@@ -130,19 +134,22 @@ func (r *Runner) RunTurn(ctx context.Context, turnID string) (err error) {
 	var reply string
 	var toolErrors []string
 	toolIdx := 0
+	lastStop := ""
 	for round := 0; round < maxRounds; round++ {
 		progress(progressText(round))
 		resp, err := r.LLM.Converse(ctx, ConverseRequest{System: system, Messages: msgs, Tools: Tools})
 		if err != nil {
 			return err
 		}
-		msgs = append(msgs, resp.Message) // includes reasoning blocks, passed back unchanged
+		lastStop = resp.StopReason
+		msgs = append(msgs, resp.Message)      // includes reasoning blocks, passed back unchanged
+		cut := resp.StopReason == "max_tokens" // a truncated tool call must not run: its input may be incomplete
 		var results []ContentBlock
 		for _, c := range resp.Message.Content {
 			if c.Text != "" {
 				reply = c.Text
 			}
-			if c.ToolUse != nil {
+			if c.ToolUse != nil && !cut {
 				progress("using " + strings.ReplaceAll(c.ToolUse.Name, "_", " "))
 				out, err := r.execTool(ctx, t, toolIdx, *c.ToolUse)
 				toolIdx++
@@ -151,6 +158,9 @@ func (r *Runner) RunTurn(ctx context.Context, turnID string) (err error) {
 					toolErrors = append(toolErrors, err.Error())
 					results = append(results, ContentBlock{ToolResult: &ToolResult{ToolUseID: c.ToolUse.ID, Text: "Error: " + err.Error(), IsError: true}})
 				} else {
+					if strings.TrimSpace(out) == "" {
+						out = "(nothing on record)" // Bedrock rejects empty text blocks
+					}
 					results = append(results, ContentBlock{ToolResult: &ToolResult{ToolUseID: c.ToolUse.ID, Text: out}})
 				}
 			}
@@ -167,8 +177,15 @@ func (r *Runner) RunTurn(ctx context.Context, turnID string) (err error) {
 		}
 		msgs = append(msgs, Message{Role: "user", Content: results})
 	}
+	if lastStop == "tool_use" {
+		reply = strings.TrimSpace(reply + "\n\nI ran out of steps before finishing. Send the message again to continue.")
+	}
 	if strings.TrimSpace(reply) == "" {
-		reply = "I've read what you sent. Have a look at the cards above and confirm what's right."
+		if len(r.proposals) > 0 {
+			reply = "I've read what you sent. Have a look at the cards above and confirm what's right."
+		} else {
+			reply = "I've read what you sent, but I couldn't turn it into a card yet. Tell me which helper it is about and what was agreed, or paste the message again."
+		}
 	}
 	if len(r.proposals) == 0 && len(toolErrors) > 0 {
 		// no card was created; make sure the reason is visible whatever the model wrote
@@ -215,6 +232,10 @@ func friendly(err error) string {
 		return "The Claude model is not enabled in this AWS account/region yet. See the README prerequisites."
 	case strings.Contains(s, "context deadline exceeded"):
 		return "That took too long. Try sending fewer screenshots at once."
+	case strings.Contains(s, "ValidationException") && (strings.Contains(s, "image") || strings.Contains(s, "Image")):
+		return "One of the screenshots could not be read by the model (too large, too tall or an unsupported format). Crop or shrink it and try again."
+	case strings.Contains(s, "ValidationException"):
+		return "The model rejected the request. Start a new conversation and send the message again."
 	}
 	return s
 }
